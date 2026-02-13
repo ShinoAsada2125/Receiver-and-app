@@ -61,16 +61,31 @@ void parseCSVData(const String& data, float values[], int& count);
 void sendLoRaCommand(const String& command);
 void printSystemStatus();
 
-// BLE helper: notify if connected
+// BLE helper: notify if connected (with message chunking to prevent fragmentation issues)
 void bleNotify(const String &msg) {
-  // Use server connected count to determine if any client is connected
-  if (pBleTx && pBleServer && pBleServer->getConnectedCount() > 0) {
-    // Ensure a stable data pointer when passing to setValue
-    // Add newline terminator for message boundary detection
-    String msgWithNewline = msg + "\n";
-    std::string s = msgWithNewline.c_str();
+  // CRITICAL: Check ALL pointers are valid BEFORE use
+  if (pBleServer == nullptr || pBleTx == nullptr) return;
+  if (pBleServer->getConnectedCount() == 0) return;
+  
+  // CRITICAL: Send message in small chunks (< 20 bytes) with NEWLINE delimiters
+  // This ensures Flutter receives complete, parseable messages instead of fragments
+  const int CHUNK_SIZE = 18;  // 18 bytes per chunk (leave room for newline + safety margin)
+  
+  String fullMsg = msg + "\n";  // Add newline as message terminator
+  
+  for (int i = 0; i < fullMsg.length(); i += CHUNK_SIZE) {
+    int len = CHUNK_SIZE;
+    if (i + len > fullMsg.length()) {
+      len = fullMsg.length() - i;
+    }
+    
+    String chunk = fullMsg.substring(i, i + len);
+    std::string s = chunk.c_str();
     pBleTx->setValue((uint8_t*)s.data(), s.length());
     pBleTx->notify();
+    
+    // Small delay between notifications to prevent buffer overflow on phone
+    delay(10);
   }
 }
 
@@ -228,6 +243,8 @@ void setup() {
   
   // Start advertising
   pAdv->start();
+
+
   delay(200); // Give advertising time to start properly
   
   Serial.println("✓ BLE initialized (NUS-like)");
@@ -243,6 +260,23 @@ void setup() {
 // ================================================================================
 void loop() {
   unsigned long currentTime = millis();
+  
+  // ===== BLE ADVERTISING WATCHDOG (critical for Android) =====
+  {
+    static unsigned long lastBleWatchdog = 0;
+    if (currentTime - lastBleWatchdog > 8000) {  // Every 15 seconds
+      lastBleWatchdog = currentTime;
+      if (pBleServer && pBleServer->getConnectedCount() == 0) {
+        NimBLEAdvertising* pAdv = NimBLEDevice::getAdvertising();
+        if (pAdv && !pAdv->isAdvertising()) {
+          pAdv->stop();
+          delay(50);
+          pAdv->start();
+          Serial.println("🛡️ BLE watchdog: Forced advertising restart");
+        }
+      }
+    }
+  }
   
   // 1. Check for incoming LoRa data using DIO0 pin (most reliable)
   if (loraInitialized) {
@@ -366,16 +400,17 @@ void checkIncomingLoRaData() {
       else if (rssi > -120) Serial.println("   💡 USABLE SIGNAL");
       else Serial.println("   ⚠️  WEAK SIGNAL");
 
-      // If the packet is a sensor CSV (starts with "WT1"), convert->JSON and ACK.
-      if (loraData.startsWith("WT1")) {
+      // If the packet is a sensor CSV (6 fields: T1,H1,T2,H2,VOL,TANK), convert to JSON
+      // Simple check: data doesn't start with special prefix and contains commas
+      float testValues[6];
+      int testCount = 0;
+      parseCSVData(loraData, testValues, testCount);
+      
+      if (testCount == 6 && !loraData.startsWith("ACKCMD:") && !loraData.startsWith("REJECT:")) {
+        // This is our simplified sensor CSV format
         String json = convertToJSON(loraData);
         Serial.println(json);
         bleNotify(json);
-
-        // CRITICAL FIX: Send STATUS instead of ACK to prevent command loop
-        // Transmitter ignores STATUS packets but logs them
-        String status = "STATUS:RX:" + String(packetCounter);
-        sendLoRaCommand(status);
       }
        else if (loraData.startsWith("ACKCMD:")) {
         // Command ACK from transmitter - forward structured JSON
@@ -491,31 +526,51 @@ void checkSerialCommands() {
 // ================================================================================
 // SECTION 11: DATA CONVERSION FUNCTIONS
 // ================================================================================
+// Helper: Escape string for JSON (handle quotes, backslashes, newlines, etc.)
+String escapeJsonString(const String& str) {
+  String result = "";
+  for (int i = 0; i < str.length(); i++) {
+    char c = str[i];
+    switch (c) {
+      case '"':  result += "\\\""; break;
+      case '\\': result += "\\\\"; break;
+      case '\n': result += "\\n"; break;
+      case '\r': result += "\\r"; break;
+      case '\t': result += "\\t"; break;
+      default:
+        if (c >= 32 && c < 127) {  // Printable ASCII
+          result += c;
+        } else {
+          // Non-printable: skip or replace with ?
+          result += '?';
+        }
+    }
+  }
+  return result;
+}
+
 String convertToJSON(const String& loraData) {
-  // Expected format: "WT1,T1,H1,T2,H2,WL,VOL,PERCENT,PKT#,TANK"
-  float values[10];
+  // Expected format: "T1,H1,T2,H2,VOL,TANK" (6 fields)
+  float values[6];
   int valueCount = 0;
   
   // Parse CSV data
   parseCSVData(loraData, values, valueCount);
   
   // Validate we have enough values
-  if (valueCount < 10) {
-    return "{\"error\":\"Invalid data format\",\"raw\":\"" + loraData + "\"}";
+  if (valueCount < 6) {
+    String safeData = escapeJsonString(loraData);
+    return "{\"error\":\"Invalid data format\",\"raw\":\"" + safeData + "\",\"fields_found\":" + String(valueCount) + "}";
   }
   
-  // Build JSON object
+  // Build JSON object with proper escaping - only the 6 required fields
   String json = "{";
-  json += "\"sensor\":\"WT1\",";
-  json += "\"temp1\":" + String(values[1], 1) + ",";
-  json += "\"humid1\":" + String(values[2], 1) + ",";
-  json += "\"temp2\":" + String(values[3], 1) + ",";
-  json += "\"humid2\":" + String(values[4], 1) + ",";
-  json += "\"water_level\":" + String(values[5], 1) + ",";
-  json += "\"volume\":" + String(values[6], 1) + ",";
-  json += "\"percent\":" + String(values[7], 1) + ",";
-  json += "\"packet\":" + String((int)values[8]) + ",";
-  json += "\"tank_full\":" + String(values[9] == 1 ? "true" : "false") + ",";
+  json += "\"temp1\":" + String(values[0], 1) + ",";
+  json += "\"humid1\":" + String(values[1], 1) + ",";
+  json += "\"temp2\":" + String(values[2], 1) + ",";
+  json += "\"humid2\":" + String(values[3], 1) + ",";
+  json += "\"volume\":" + String(values[4], 1) + ",";
+  json += "\"tank_full\":" + String(values[5] == 1 ? "true" : "false") + ",";
   json += "\"timestamp\":" + String(millis() / 1000) + ",";
   json += "\"rssi\":" + String(radio.getRSSI(), 1) + ",";
   json += "\"snr\":" + String(radio.getSNR(), 1);
@@ -529,7 +584,8 @@ void parseCSVData(const String& data, float values[], int& count) {
   int startIndex = 0;
   int commaIndex = 0;
   
-  while (commaIndex >= 0 && count < 10) {
+  // Parse up to 6 values: T1,H1,T2,H2,VOL,TANK
+  while (commaIndex >= 0 && count < 6) {
     commaIndex = data.indexOf(',', startIndex);
     
     String valueStr;
@@ -540,12 +596,7 @@ void parseCSVData(const String& data, float values[], int& count) {
       valueStr = data.substring(startIndex);
     }
     
-    // Handle special case for first value (should be "WT1")
-    if (count == 0 && valueStr == "WT1") {
-      values[count++] = 0;  // Placeholder
-    } else {
-      values[count++] = valueStr.toFloat();
-    }
+    values[count++] = valueStr.toFloat();
   }
 }
 
@@ -562,7 +613,8 @@ void sendLoRaCommand(const String& command) {
   int state = RADIOLIB_ERR_UNKNOWN;
   
   // Convert String to C-string for RadioLib
-  const char* cmd_cstr = command.c_str();
+  String cmdWithNewline = command + "\n";  // Add newline
+  const char* cmd_cstr = cmdWithNewline.c_str();
   Serial.printf("\n📤 LoRa TX COMMAND: [%s] (%d bytes)\n", cmd_cstr, command.length());
   
   // Stop receive mode before transmitting

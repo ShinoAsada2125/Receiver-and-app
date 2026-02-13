@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_reactive_ble/flutter_reactive_ble.dart';
 import 'dart:io' show Platform;
 import 'package:permission_handler/permission_handler.dart';
+import 'dart:math'; 
 
 // Ignore some info-level analyzer suggestions in this file
 // (prefer_const_constructors and sized_box_for_whitespace are informational)
@@ -41,6 +42,8 @@ class _DashboardState extends State<Dashboard> {
   StreamSubscription<DiscoveredDevice>? _scanSub;
   StreamSubscription<ConnectionStateUpdate>? _connSub;
   StreamSubscription<List<int>>? _notifySub;
+  StreamSubscription<BleStatus>? _bleStatusSub;
+
 
   String? _deviceId;
   bool _connected = false;
@@ -72,6 +75,34 @@ class _DashboardState extends State<Dashboard> {
   @override
   void initState() {
     super.initState();
+    // Watch BLE adapter state so UI can show why scans fail
+    _bleStatusSub = _ble.statusStream.listen((status) {
+      String s;
+      switch (status) {
+        case BleStatus.ready:
+          s = _connected ? 'Connected' : 'Idle';
+          break;
+        case BleStatus.poweredOff:
+          s = 'Bluetooth disabled';
+          break;
+        case BleStatus.unauthorized:
+          s = 'Bluetooth unauthorized';
+          break;
+        case BleStatus.unsupported:
+          s = 'Bluetooth unsupported';
+          break;
+        case BleStatus.locationServicesDisabled:
+          s = 'Location services disabled';
+          break;
+        default:
+          s = 'BLE: $status';
+      }
+      setState(() {
+        _status = s;
+      });
+      _logAdd('BLE adapter: $status');
+    });
+
     _ensurePermissionsAndStart();
   }
 
@@ -106,26 +137,73 @@ class _DashboardState extends State<Dashboard> {
     }
   }
 
-  void _startScan() {
-    _logAdd('Scanning for $bleDeviceName...');
-    // Scan WITHOUT service UUID filter first (some devices don't advertise service UUID properly)
-    // We'll verify by device name which is more reliable
-    _scanSub = _ble.scanForDevices(withServices: []).listen((device) {
+ void _startScan() {
+  _ble.scanForDevices(withServices: [serviceUuid]); // ← UUID filter REQUIRED
+  // Cancel any existing scan first
+  _scanSub?.cancel();
+  _scanSub = null;
+  
+  // Wait for BLE adapter to be fully ready (critical after power cycle)
+  _ble.statusStream.firstWhere((status) => status == BleStatus.ready).then((_) {
+    _logAdd('🔍 Starting UUID-filtered scan for LoRaReceiver...');
+    
+    // ===== PHASE 1: FILTERED SCAN (Primary method - avoids random devices) =====
+    _scanSub = _ble.scanForDevices(
+      withServices: [serviceUuid], // ONLY scan devices with OUR service UUID
+      scanMode: ScanMode.lowLatency,
+    ).listen((device) {
       String name = device.name.isNotEmpty ? device.name : 'N/A';
-      _logAdd('Found: $name (${device.id}) RSSI:${device.rssi}');
       
-      // Only connect to devices named exactly "LoRaReceiver"
-      if ((_deviceId == null) && device.name == bleDeviceName) {
-        _logAdd('✓ Target device found: $name');
+      // Double-verify: name MUST match AND have our service
+      if ((_deviceId == null) && name == bleDeviceName) {
+        _logAdd('✓ Target found via UUID filter: $name (${device.id}) RSSI:${device.rssi}');
         _scanSub?.cancel();
         _scanSub = null;
         _deviceId = device.id;
         _connectToDevice(device.id);
       }
     }, onError: (e) {
-      _logAdd('Scan error: $e');
+      _logAdd('Filtered scan error: $e');
     });
-  }
+    
+    // ===== FALLBACK: If no device found after 5s, try unfiltered scan =====
+    Future.delayed(const Duration(seconds: 5), () {
+      if (_deviceId == null && _scanSub != null) {
+        _scanSub?.cancel();
+        _scanSub = null;
+        _logAdd('⚠️ UUID scan timeout - trying name-based fallback...');
+        
+        // Unfiltered scan but filter by NAME in callback
+        _scanSub = _ble.scanForDevices(withServices: []).listen((device) {
+          if ((_deviceId == null) && device.name == bleDeviceName) {
+            _logAdd('✓ Found via name fallback: ${device.name} (${device.id})');
+            _scanSub?.cancel();
+            _scanSub = null;
+            _deviceId = device.id;
+            _connectToDevice(device.id);
+          }
+        }, onError: (e) => _logAdd('Fallback scan error: $e'));
+        
+        // Final timeout: stop scan after 10s total to save battery
+        Future.delayed(const Duration(seconds: 10), () {
+          if (_scanSub != null && _deviceId == null) {
+            _scanSub?.cancel();
+            _scanSub = null;
+            _logAdd('⏱️ Scan failed after 15s total - retrying...');
+            Future.delayed(const Duration(seconds: 2), () {
+              if (!_connected) _startScan(); // Auto-retry
+            });
+          }
+        });
+      }
+    });
+  }).catchError((e) {
+    _logAdd('BLE not ready: $e');
+    Future.delayed(const Duration(seconds: 2), () {
+      if (!_connected) _startScan();
+    });
+  });
+}
 
   void _connectToDevice(String id) {
     setState(() {
@@ -147,8 +225,7 @@ class _DashboardState extends State<Dashboard> {
         });
         _deviceId = null;
         _notifySub?.cancel();
-        // restart scanning
-        Future.delayed(const Duration(seconds: 1), () => _startScan());
+        // NOTE: Auto-rescanning disabled - user must click Scan to reconnect
       }
     }, onError: (e) {
       _logAdd('Connection error: $e');
@@ -171,81 +248,73 @@ class _DashboardState extends State<Dashboard> {
     });
   }
 
-  void _handleIncoming(String s) {
-    s = s.trim();
-    try {
-      // Handle JSON messages with buffering for BLE fragmentation
-      if (s.startsWith('{') || _messageBuffer.isNotEmpty) {
-        _messageBuffer += s;
-        // Check if message is complete (ends with } or }\n)
-        if (_messageBuffer.endsWith('}') || 
-            _messageBuffer.endsWith('}\n') || 
-            _messageBuffer.endsWith('}\r\n')) {
-          // Message is complete - process it
-          String completeMsg = _messageBuffer
-              .replaceAll(RegExp(r'[\r\n]+$'), '')
-              .trim();
-          _messageBuffer = ''; // Clear buffer
-          
-          // Ensure it's valid JSON
-          if (!completeMsg.endsWith('}')) {
-            completeMsg += '}';
-          }
-          
-          try {
-            final m = jsonDecode(completeMsg);
-            _logAdd('✓ JSON parsed (${m.length} fields)');
-            // Parse sensor JSON from receiver
-            setState(() {
-              for (var k in m.keys) {
-                var oldVal = sensor[k];
-                sensor[k] = m[k];
-                if (oldVal != m[k]) {
-                  _logAdd('  $k: $oldVal → ${m[k]}');
-                }
-              }
-            });
-          } catch (e) {
-            _logAdd('❌ Parse error: $e | Data: ${completeMsg.substring(0, completeMsg.length > 100 ? 100 : completeMsg.length)}...');
-          }
-          return;
-        } else {
-          // Message incomplete - wait for more data
-          _logAdd('⏳ Buffering (${_messageBuffer.length} chars)...');
-          return;
-        }
-      } else if (s.startsWith('WT1')) {
-        // CSV from transmitter (fallback)
-        List<String> parts = s.split(',');
-        if (parts.length >= 10) {
-          setState(() {
-            sensor['temp1'] = double.tryParse(parts[1]) ?? sensor['temp1'];
-            sensor['humid1'] = double.tryParse(parts[2]) ?? sensor['humid1'];
-            sensor['temp2'] = double.tryParse(parts[3]) ?? sensor['temp2'];
-            sensor['humid2'] = double.tryParse(parts[4]) ?? sensor['humid2'];
-            sensor['water_level'] = double.tryParse(parts[5]) ?? sensor['water_level'];
-            sensor['volume'] = double.tryParse(parts[6]) ?? sensor['volume'];
-            sensor['percent'] = double.tryParse(parts[7]) ?? sensor['percent'];
-            sensor['packet'] = int.tryParse(parts[8]) ?? sensor['packet'];
-            sensor['tank_full'] = parts[9] == '1';
-            sensor['timestamp'] = DateTime.now().toIso8601String();
-          });
-        }
-      } else if (s.startsWith('REJECT:')) {
-        // REJECT:<device>:<reason>
-        var parts = s.split(':');
-        String device = parts.length > 1 ? parts[1] : '';
-        String reason = parts.length > 2 ? parts.sublist(2).join(':') : '';
-        _logAdd('Command rejected: $device ($reason)');
-      } else if (s.startsWith('ACKCMD:') || s.startsWith('ACK:')) {
-        _logAdd('ACK: $s');
-      } else {
-        _logAdd('Unhandled message: $s');
+ void _handleIncoming(String s) {
+  // CRITICAL: BLE fragments use NEWLINE as packet boundary (ESP32 MUST send '\n')
+  _messageBuffer += s;
+  
+  // Process ALL complete messages (handles back-to-back transmissions)
+  while (_messageBuffer.contains('\n')) {
+    int newlineIndex = _messageBuffer.indexOf('\n');
+    String completeMsg = _messageBuffer.substring(0, newlineIndex).trim();
+    _messageBuffer = _messageBuffer.substring(newlineIndex + 1);
+    
+    if (completeMsg.isEmpty) continue;
+    
+    // DEBUG: Log complete message size
+    _logAdd('📦 Complete (${completeMsg.length}B): ${completeMsg.substring(0, min(completeMsg.length, 40))}...');
+    
+    // JSON sensor data
+    if (completeMsg.startsWith('{') && completeMsg.endsWith('}')) {
+      try {
+        final m = jsonDecode(completeMsg);
+        setState(() {
+          sensor['temp1'] = (m['temp1'] as num?)?.toDouble() ?? sensor['temp1'] ?? 0.0;
+          sensor['humid1'] = (m['humid1'] as num?)?.toDouble() ?? sensor['humid1'] ?? 0.0;
+          sensor['temp2'] = (m['temp2'] as num?)?.toDouble() ?? sensor['temp2'] ?? 0.0;
+          sensor['humid2'] = (m['humid2'] as num?)?.toDouble() ?? sensor['humid2'] ?? 0.0;
+          sensor['water_level'] = (m['water_level'] as num?)?.toDouble() ?? sensor['water_level'] ?? 0.0;
+          sensor['volume'] = (m['volume'] as num?)?.toDouble() ?? sensor['volume'] ?? 0.0;
+          sensor['percent'] = (m['percent'] as num?)?.toDouble() ?? sensor['percent'] ?? 0.0;
+          sensor['packet'] = m['packet'] ?? sensor['packet'] ?? 0;
+          sensor['tank_full'] = m['tank_full'] ?? sensor['tank_full'] ?? false;
+          sensor['rssi'] = (m['rssi'] as num?)?.toDouble() ?? sensor['rssi'] ?? 0.0;
+          sensor['snr'] = (m['snr'] as num?)?.toDouble() ?? sensor['snr'] ?? 0.0;
+          sensor['timestamp'] = DateTime.now().toIso8601String();
+        });
+        _logAdd('✅ UI updated');
+      } catch (e) {
+        _logAdd('❌ JSON error: $e | Data: ${completeMsg.substring(0, min(completeMsg.length, 100))}');
       }
-    } catch (e) {
-      _logAdd('Parse error: $e');
+    } 
+    // Command responses
+    else if (completeMsg.startsWith('ACKCMD:') || completeMsg.startsWith('REJECT:')) {
+      _logAdd('📨 ${completeMsg.startsWith('REJECT:') ? '❌' : '✓'} $completeMsg');
+    }
+    // Simplified CSV fallback (6 fields: T1,H1,T2,H2,VOL,TANK)
+    else if (RegExp(r'^[\d.-]+,[\d.-]+,[\d.-]+,[\d.-]+,[\d.-]+,[01]$').hasMatch(completeMsg)) {
+      _logAdd('📊 CSV (simplified): $completeMsg');
+      List<String> parts = completeMsg.split(',');
+      if (parts.length >= 6) {
+        setState(() {
+          sensor['temp1'] = double.tryParse(parts[0]) ?? sensor['temp1'];
+          sensor['humid1'] = double.tryParse(parts[1]) ?? sensor['humid1'];
+          sensor['temp2'] = double.tryParse(parts[2]) ?? sensor['temp2'];
+          sensor['humid2'] = double.tryParse(parts[3]) ?? sensor['humid2'];
+          sensor['volume'] = double.tryParse(parts[4]) ?? sensor['volume'];
+          sensor['tank_full'] = parts[5] == '1';
+          sensor['timestamp'] = DateTime.now().toIso8601String();
+        });
+        _logAdd('✓ CSV parsed: T1=${sensor['temp1']}°C, Vol=${sensor['volume']}L');
+      }
     }
   }
+  
+  // Safety: Prevent buffer overflow
+  if (_messageBuffer.length > 500) {
+    _logAdd('⚠️ Buffer overflow - cleared ${_messageBuffer.length} chars');
+    _messageBuffer = '';
+  }
+}
 
   void _sendCommand(String cmd) async {
     if (!_connected || _deviceId == null) {
@@ -279,6 +348,9 @@ class _DashboardState extends State<Dashboard> {
     });
   }
 
+  
+
+
   @override
   void dispose() {
     _scanSub?.cancel();
@@ -287,6 +359,8 @@ class _DashboardState extends State<Dashboard> {
     _connSub = null;
     _notifySub?.cancel();
     _notifySub = null;
+    _bleStatusSub?.cancel();
+    _bleStatusSub = null;
     _cmdController.dispose();
     super.dispose();
   }
@@ -308,27 +382,34 @@ class _DashboardState extends State<Dashboard> {
             title: const Text('Status'),
             subtitle: Text(_status),
             trailing: ElevatedButton(
-              child: Text(_connected ? 'Disconnect' : 'Scan'),
-              onPressed: () {
-                if (_connected && _deviceId != null) {
-                  _logAdd('📴 Disconnecting...');
-                  _notifySub?.cancel();
-                  _notifySub = null;
-                  _connSub?.cancel();
-                  _connSub = null;
-                  setState(() {
-                    _connected = false;
-                    _status = 'Disconnected';
-                    _deviceId = null;
-                  });
-                  _logAdd('✓ Disconnected');
-                  // Optionally restart scanning after a delay
-                  Future.delayed(const Duration(seconds: 1), () => _startScan());
-                } else {
-                  _startScan();
-                }
-              },
-            ),
+  child: Text(_connected ? 'Disconnect' : 'Scan'),
+  onPressed: () {
+  if (_connected && _deviceId != null) {
+    _logAdd('📴 Disconnecting...');
+    
+    // 1. Cancel characteristic notification subscription FIRST
+    _notifySub?.cancel();
+    _notifySub = null;
+    
+    // 2. Cancel connection subscription (this triggers actual BLE disconnect)
+    _connSub?.cancel();
+    _connSub = null;
+    
+    // 3. Update UI state after short delay (allows OS to process disconnect)
+    Future.delayed(const Duration(milliseconds: 500), () {
+      setState(() {
+        _connected = false;
+        _status = 'Disconnected';
+        _deviceId = null;
+      });
+      _logAdd('✓ Disconnected');
+      // NOTE: Auto-rescanning disabled - user must click Scan to reconnect
+    });
+  } else {
+    _startScan();
+  }
+},
+),
           ),
           Expanded(
             child: ListView(
@@ -337,13 +418,10 @@ class _DashboardState extends State<Dashboard> {
                 _sensorTile('Humid1 (%)', 'humid1'),
                 _sensorTile('Temp2 (°C)', 'temp2'),
                 _sensorTile('Humid2 (%)', 'humid2'),
-                _sensorTile('Water Level (cm)', 'water_level'),
                 _sensorTile('Volume (L)', 'volume'),
-                _sensorTile('Percent (%)', 'percent'),
-                _sensorTile('Packet #', 'packet'),
                 _sensorTile('Tank Full', 'tank_full'),
-                _sensorTile('RSSI', 'rssi'),
-                _sensorTile('SNR', 'snr'),
+                _sensorTile('RSSI (dBm)', 'rssi'),
+                _sensorTile('SNR (dB)', 'snr'),
                 const Divider(),
                 Padding(
                   padding: const EdgeInsets.symmetric(horizontal: 16.0),
