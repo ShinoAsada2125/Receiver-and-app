@@ -71,6 +71,7 @@ class _DashboardState extends State<Dashboard> {
   bool fan1On = false;
   bool fan2On = false;
   bool fan3On = false;
+  bool _tankFull = false;
   
   // Message buffering for incomplete JSON (BLE fragmentation)
   String _messageBuffer = '';
@@ -295,6 +296,29 @@ class _DashboardState extends State<Dashboard> {
             _logAdd('✅ Command ACK: ${m['raw'] ?? ''} (RSSI: ${m['rssi']})');
           } else if (msgType == 'reject') {
             _logAdd('❌ Command REJECTED: ${m['command'] ?? ''} - ${m['reason'] ?? 'unknown'}');
+          } else if (msgType == 'status') {
+            // Tank safety STATUS from transmitter
+            bool isFull = m['tank_full'] == true;
+            _logAdd(isFull ? '🚨 TANK FULL - All devices shut down!' : '✅ TANK OK - Devices restored');
+            setState(() {
+              _tankFull = isFull;
+              sensor['tank_full'] = isFull;
+              if (isFull) {
+                // Tank full: all devices forced OFF by transmitter
+                fan1On = false;
+                fan2On = false;
+                fan3On = false;
+                heaterOn = false;
+                dehumOn = false;
+              } else {
+                // Tank OK: transmitter auto-restored all devices ON
+                fan1On = true;
+                fan2On = true;
+                fan3On = true;
+                heaterOn = true;
+                dehumOn = true;
+              }
+            });
           } else {
             _logAdd('📨 Message: ${m['raw'] ?? sanitized}');
           }
@@ -315,6 +339,18 @@ class _DashboardState extends State<Dashboard> {
             sensor['percent'] = (m['percent'] as num?)?.toDouble() ?? sensor['percent'] ?? 0.0;
             sensor['packet'] = m['packet'] ?? sensor['packet'] ?? 0;
             sensor['tank_full'] = m['tank_full'] ?? sensor['tank_full'] ?? false;
+            // Sync _tankFull from sensor data
+            bool newTankFull = sensor['tank_full'] == true;
+            if (newTankFull != _tankFull) {
+              _tankFull = newTankFull;
+              if (_tankFull) {
+                fan1On = false; fan2On = false; fan3On = false;
+                heaterOn = false; dehumOn = false;
+              } else {
+                fan1On = true; fan2On = true; fan3On = true;
+                heaterOn = true; dehumOn = true;
+              }
+            }
             sensor['rssi'] = (m['rssi'] as num?)?.toDouble() ?? sensor['rssi'] ?? 0.0;
             sensor['snr'] = (m['snr'] as num?)?.toDouble() ?? sensor['snr'] ?? 0.0;
             sensor['timestamp'] = DateTime.now().toIso8601String();
@@ -480,6 +516,26 @@ class _DashboardState extends State<Dashboard> {
                 _sensorTile('RSSI (dBm)', 'rssi'),
                 _sensorTile('SNR (dB)', 'snr'),
                 const Divider(),
+                // TANK FULL warning banner
+                if (_tankFull)
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(12),
+                    margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                    decoration: BoxDecoration(
+                      color: Colors.red.shade700,
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: const Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Icon(Icons.warning_amber_rounded, color: Colors.white, size: 24),
+                        SizedBox(width: 8),
+                        Text('TANK FULL — All Devices Shut Down',
+                          style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 15)),
+                      ],
+                    ),
+                  ),
                 const Text('Control Buttons', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
                 const SizedBox(height: 8),
                 // FAN Controls (3 buttons in a row)
@@ -489,9 +545,11 @@ class _DashboardState extends State<Dashboard> {
                     children: [
                       Expanded(
                         child: ElevatedButton(
-                          style: ElevatedButton.styleFrom(backgroundColor: fan1On ? Colors.green : Colors.grey),
-                          child: Text('FAN1\n${fan1On ? 'OFF' : 'ON'}', textAlign: TextAlign.center),
-                          onPressed: () {
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: _tankFull ? Colors.red.shade300 : (fan1On ? Colors.green : Colors.grey),
+                          ),
+                          child: Text(_tankFull ? 'FAN1\nLOCKED' : 'FAN1\n${fan1On ? 'OFF' : 'ON'}', textAlign: TextAlign.center),
+                          onPressed: _tankFull ? null : () {
                             fan1On = !fan1On;
                             _sendCommand('FAN1:${fan1On ? 'ON' : 'OFF'}');
                             setState(() {});
@@ -501,9 +559,11 @@ class _DashboardState extends State<Dashboard> {
                       const SizedBox(width: 8),
                       Expanded(
                         child: ElevatedButton(
-                          style: ElevatedButton.styleFrom(backgroundColor: fan2On ? Colors.green : Colors.grey),
-                          child: Text('FAN2\n${fan2On ? 'OFF' : 'ON'}', textAlign: TextAlign.center),
-                          onPressed: () {
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: _tankFull ? Colors.red.shade300 : (fan2On ? Colors.green : Colors.grey),
+                          ),
+                          child: Text(_tankFull ? 'FAN2\nLOCKED' : 'FAN2\n${fan2On ? 'OFF' : 'ON'}', textAlign: TextAlign.center),
+                          onPressed: _tankFull ? null : () {
                             fan2On = !fan2On;
                             _sendCommand('FAN2:${fan2On ? 'ON' : 'OFF'}');
                             setState(() {});
@@ -513,9 +573,11 @@ class _DashboardState extends State<Dashboard> {
                       const SizedBox(width: 8),
                       Expanded(
                         child: ElevatedButton(
-                          style: ElevatedButton.styleFrom(backgroundColor: fan3On ? Colors.green : Colors.grey),
-                          child: Text('FAN3\n${fan3On ? 'OFF' : 'ON'}', textAlign: TextAlign.center),
-                          onPressed: () {
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: _tankFull ? Colors.red.shade300 : (fan3On ? Colors.green : Colors.grey),
+                          ),
+                          child: Text(_tankFull ? 'FAN3\nLOCKED' : 'FAN3\n${fan3On ? 'OFF' : 'ON'}', textAlign: TextAlign.center),
+                          onPressed: _tankFull ? null : () {
                             fan3On = !fan3On;
                             _sendCommand('FAN3:${fan3On ? 'ON' : 'OFF'}');
                             setState(() {});
@@ -533,9 +595,11 @@ class _DashboardState extends State<Dashboard> {
                     children: [
                       Expanded(
                         child: ElevatedButton(
-                          style: ElevatedButton.styleFrom(backgroundColor: heaterOn ? Colors.orange : Colors.grey),
-                          child: Text(heaterOn ? 'HEATER+FAN1\nOFF' : 'HEATER+FAN1\nON', textAlign: TextAlign.center),
-                          onPressed: () {
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: _tankFull ? Colors.red.shade300 : (heaterOn ? Colors.orange : Colors.grey),
+                          ),
+                          child: Text(_tankFull ? 'HEATER+FAN1\nLOCKED' : (heaterOn ? 'HEATER+FAN1\nOFF' : 'HEATER+FAN1\nON'), textAlign: TextAlign.center),
+                          onPressed: _tankFull ? null : () {
                             heaterOn = !heaterOn;
                             String action = heaterOn ? 'ON' : 'OFF';
                             
@@ -558,9 +622,11 @@ class _DashboardState extends State<Dashboard> {
                       const SizedBox(width: 12),
                       Expanded(
                         child: ElevatedButton(
-                          style: ElevatedButton.styleFrom(backgroundColor: dehumOn ? Colors.blue : Colors.grey),
-                          child: Text(dehumOn ? 'DEHUM\nOFF' : 'DEHUM\nON', textAlign: TextAlign.center),
-                          onPressed: () {
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: _tankFull ? Colors.red.shade300 : (dehumOn ? Colors.blue : Colors.grey),
+                          ),
+                          child: Text(_tankFull ? 'DEHUM\nLOCKED' : (dehumOn ? 'DEHUM\nOFF' : 'DEHUM\nON'), textAlign: TextAlign.center),
+                          onPressed: _tankFull ? null : () {
                             dehumOn = !dehumOn;
                             String cmd = 'DEHUM:${dehumOn ? 'ON' : 'OFF'}';
                             _sendCommand(cmd);

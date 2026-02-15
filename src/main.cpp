@@ -465,6 +465,22 @@ void checkIncomingLoRaData() {
         json += "}";
         Serial.println(json);
         bleNotify(json);
+      } else if (loraData.startsWith("STATUS:")) {
+        // Tank status change from transmitter (TANK_FULL or TANK_OK)
+        String statusValue = loraData.substring(7);  // After "STATUS:"
+        statusValue.trim();
+        Serial.printf("📡 STATUS received from transmitter: [%s]\n", statusValue.c_str());
+        
+        String json = "{";
+        json += "\"type\":\"status\",";
+        json += "\"status\":\"" + escapeJsonString(statusValue) + "\",";
+        json += "\"tank_full\":" + String(statusValue == "TANK_FULL" ? "true" : "false") + ",";
+        json += "\"timestamp\":" + String(millis() / 1000) + ",";
+        json += "\"rssi\":" + String(rssi, 1) + ",";
+        json += "\"snr\":" + String(snr, 1);
+        json += "}";
+        Serial.println(json);
+        bleNotify(json);
       } else if (loraData.startsWith("REJECT:")) {
         // Expected format: REJECT:<command>:<REASON>
         int firstColon = loraData.indexOf(':'); // index of ':' after REJECT
