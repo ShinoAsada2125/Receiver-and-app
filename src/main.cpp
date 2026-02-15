@@ -322,12 +322,16 @@ if (currentTime - lastConnCheck > 5000) {
   }
   
   // 3. Check for data timeout (warn if no data for 30+ seconds)
-  if (currentTime - lastDataReceived >= DATA_TIMEOUT_MS && lastDataReceived > 0) {
+  //    Skip during first 30s of uptime (lastDataReceived from setup() isn't real data)
+  if (currentTime > DATA_TIMEOUT_MS && lastDataReceived > 0 && 
+      currentTime > lastDataReceived &&  // Prevent unsigned underflow → 4294967s bug
+      (currentTime - lastDataReceived) >= DATA_TIMEOUT_MS) {
     static unsigned long lastWarning = 0;
     // Only warn every 30 seconds (not every 5 seconds - reduces spam)
     if (currentTime - lastWarning >= 30000) {
+      unsigned long secsSinceData = (currentTime - lastDataReceived) / 1000;
       Serial.println("⚠️ WARNING: No LoRa data received for " + 
-                     String((currentTime - lastDataReceived) / 1000) + " seconds");
+                     String(secsSinceData) + " seconds");
       lastWarning = currentTime;
       
       // Restart receiver if timeout occurs
