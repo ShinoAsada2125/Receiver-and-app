@@ -68,6 +68,9 @@ class _DashboardState extends State<Dashboard> {
   final TextEditingController _cmdController = TextEditingController();
   bool heaterOn = false;
   bool dehumOn = false;
+  bool fan1On = false;
+  bool fan2On = false;
+  bool fan3On = false;
   
   // Message buffering for incomplete JSON (BLE fragmentation)
   String _messageBuffer = '';
@@ -209,9 +212,23 @@ class _DashboardState extends State<Dashboard> {
     setState(() {
       _status = 'Connecting...';
     });
-    _connSub = _ble.connectToDevice(id: id, connectionTimeout: const Duration(seconds: 10)).listen((event) {
+    _connSub = _ble.connectToDevice(id: id, connectionTimeout: const Duration(seconds: 10)).listen((event) async {
       if (event.connectionState == DeviceConnectionState.connected) {
-        _logAdd('Connected to device');
+        _logAdd('Connected to device - clearing GATT cache...');
+        
+        // CRITICAL FIX: Clear Android's cached GATT table
+        // This forces re-discovery of services/characteristics
+        // Without this, Android uses stale handles from previous firmware
+        try {
+          await _ble.clearGattCache(id);
+          _logAdd('\u2705 GATT cache cleared successfully');
+        } catch (e) {
+          _logAdd('\u26a0\ufe0f GATT cache clear failed (may be OK): \$e');
+        }
+        
+        // Small delay after clearing cache to let rediscovery happen
+        await Future.delayed(const Duration(milliseconds: 500));
+        
         setState(() {
           _connected = true;
           _status = 'Connected';
@@ -266,28 +283,53 @@ class _DashboardState extends State<Dashboard> {
     // JSON sensor data
     if (completeMsg.startsWith('{') && completeMsg.endsWith('}')) {
       try {
-        final m = jsonDecode(completeMsg);
-        setState(() {
-          sensor['temp1'] = (m['temp1'] as num?)?.toDouble() ?? sensor['temp1'] ?? 0.0;
-          sensor['humid1'] = (m['humid1'] as num?)?.toDouble() ?? sensor['humid1'] ?? 0.0;
-          sensor['temp2'] = (m['temp2'] as num?)?.toDouble() ?? sensor['temp2'] ?? 0.0;
-          sensor['humid2'] = (m['humid2'] as num?)?.toDouble() ?? sensor['humid2'] ?? 0.0;
-          sensor['water_level'] = (m['water_level'] as num?)?.toDouble() ?? sensor['water_level'] ?? 0.0;
-          sensor['volume'] = (m['volume'] as num?)?.toDouble() ?? sensor['volume'] ?? 0.0;
-          sensor['percent'] = (m['percent'] as num?)?.toDouble() ?? sensor['percent'] ?? 0.0;
-          sensor['packet'] = m['packet'] ?? sensor['packet'] ?? 0;
-          sensor['tank_full'] = m['tank_full'] ?? sensor['tank_full'] ?? false;
-          sensor['rssi'] = (m['rssi'] as num?)?.toDouble() ?? sensor['rssi'] ?? 0.0;
-          sensor['snr'] = (m['snr'] as num?)?.toDouble() ?? sensor['snr'] ?? 0.0;
-          sensor['timestamp'] = DateTime.now().toIso8601String();
-        });
-        _logAdd('✅ UI updated');
+        // Sanitize: strip any control characters before parsing
+        String sanitized = completeMsg.replaceAll(RegExp(r'[\x00-\x1F\x7F]'), '');
+        final m = jsonDecode(sanitized);
+        
+        // Check if this is a sensor data packet (has temp1) or a status/ack packet
+        if (m.containsKey('type')) {
+          // This is an ACKCMD, REJECT, or message from the receiver
+          String msgType = m['type'] ?? 'unknown';
+          if (msgType == 'ackcmd') {
+            _logAdd('✅ Command ACK: ${m['raw'] ?? ''} (RSSI: ${m['rssi']})');
+          } else if (msgType == 'reject') {
+            _logAdd('❌ Command REJECTED: ${m['command'] ?? ''} - ${m['reason'] ?? 'unknown'}');
+          } else {
+            _logAdd('📨 Message: ${m['raw'] ?? sanitized}');
+          }
+          // Update signal quality from any packet
+          setState(() {
+            sensor['rssi'] = (m['rssi'] as num?)?.toDouble() ?? sensor['rssi'];
+            sensor['snr'] = (m['snr'] as num?)?.toDouble() ?? sensor['snr'];
+          });
+        } else {
+          // Sensor data packet
+          setState(() {
+            sensor['temp1'] = (m['temp1'] as num?)?.toDouble() ?? sensor['temp1'] ?? 0.0;
+            sensor['humid1'] = (m['humid1'] as num?)?.toDouble() ?? sensor['humid1'] ?? 0.0;
+            sensor['temp2'] = (m['temp2'] as num?)?.toDouble() ?? sensor['temp2'] ?? 0.0;
+            sensor['humid2'] = (m['humid2'] as num?)?.toDouble() ?? sensor['humid2'] ?? 0.0;
+            sensor['water_level'] = (m['water_level'] as num?)?.toDouble() ?? sensor['water_level'] ?? 0.0;
+            sensor['volume'] = (m['volume'] as num?)?.toDouble() ?? sensor['volume'] ?? 0.0;
+            sensor['percent'] = (m['percent'] as num?)?.toDouble() ?? sensor['percent'] ?? 0.0;
+            sensor['packet'] = m['packet'] ?? sensor['packet'] ?? 0;
+            sensor['tank_full'] = m['tank_full'] ?? sensor['tank_full'] ?? false;
+            sensor['rssi'] = (m['rssi'] as num?)?.toDouble() ?? sensor['rssi'] ?? 0.0;
+            sensor['snr'] = (m['snr'] as num?)?.toDouble() ?? sensor['snr'] ?? 0.0;
+            sensor['timestamp'] = DateTime.now().toIso8601String();
+          });
+          _logAdd('✅ Sensors updated');
+        }
       } catch (e) {
-        _logAdd('❌ JSON error: $e | Data: ${completeMsg.substring(0, min(completeMsg.length, 100))}');
+        _logAdd('⚠️ JSON parse: $e');
+        // Try to extract readable text even if JSON fails
+        _logAdd('   Raw: ${completeMsg.substring(0, min(completeMsg.length, 80))}');
       }
     } 
-    // Command responses
-    else if (completeMsg.startsWith('ACKCMD:') || completeMsg.startsWith('REJECT:')) {
+    // Command responses (plain text from receiver)
+    else if (completeMsg.startsWith('ACKCMD:') || completeMsg.startsWith('REJECT:') ||
+             completeMsg.startsWith('SENT:') || completeMsg.startsWith('FORWARDED:')) {
       _logAdd('📨 ${completeMsg.startsWith('REJECT:') ? '❌' : '✓'} $completeMsg');
     }
     // Simplified CSV fallback (6 fields: T1,H1,T2,H2,VOL,TANK)
@@ -325,9 +367,18 @@ class _DashboardState extends State<Dashboard> {
       _logAdd('❌ Empty command');
       return;
     }
-    _logAdd('📤 TX: $cmd');
+    
+    // Enhanced debugging
+    _logAdd('📤 TX START: $cmd');
+    _logAdd('   Device ID: $_deviceId');
+    _logAdd('   Service UUID: ${serviceUuid.toString()}');
+    _logAdd('   RX Char UUID: ${rxChar.toString()}');
+    _logAdd('   Command bytes: ${utf8.encode(cmd).length}');
+    
     try {
-      await _ble.writeCharacteristicWithResponse(
+      // TRY METHOD 1: writeWithoutResponse (most reliable with NimBLE)
+      _logAdd('   Trying writeWithoutResponse...');
+      await _ble.writeCharacteristicWithoutResponse(
         QualifiedCharacteristic(
           serviceId: serviceUuid,
           characteristicId: rxChar,
@@ -335,9 +386,15 @@ class _DashboardState extends State<Dashboard> {
         ),
         value: utf8.encode(cmd)
       );
-      _logAdd('✓ Command sent');
+      _logAdd('\u2705 Write completed (withoutResponse)');
+      
+      // Small delay to let callback fire on ESP32 side
+      await Future.delayed(Duration(milliseconds: 100));
+      _logAdd('   (Waiting for ESP32 response...)');
+      
     } catch (e) {
       _logAdd('❌ Write error: $e');
+      _logAdd('   Error type: ${e.runtimeType}');
     }
   }
 
@@ -423,17 +480,77 @@ class _DashboardState extends State<Dashboard> {
                 _sensorTile('RSSI (dBm)', 'rssi'),
                 _sensorTile('SNR (dB)', 'snr'),
                 const Divider(),
+                const Text('Control Buttons', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                const SizedBox(height: 8),
+                // FAN Controls (3 buttons in a row)
                 Padding(
                   padding: const EdgeInsets.symmetric(horizontal: 16.0),
                   child: Row(
                     children: [
                       Expanded(
                         child: ElevatedButton(
-                          child: Text(heaterOn ? 'HEATER OFF' : 'HEATER ON'),
+                          style: ElevatedButton.styleFrom(backgroundColor: fan1On ? Colors.green : Colors.grey),
+                          child: Text('FAN1\n${fan1On ? 'OFF' : 'ON'}', textAlign: TextAlign.center),
+                          onPressed: () {
+                            fan1On = !fan1On;
+                            _sendCommand('FAN1:${fan1On ? 'ON' : 'OFF'}');
+                            setState(() {});
+                          },
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: ElevatedButton(
+                          style: ElevatedButton.styleFrom(backgroundColor: fan2On ? Colors.green : Colors.grey),
+                          child: Text('FAN2\n${fan2On ? 'OFF' : 'ON'}', textAlign: TextAlign.center),
+                          onPressed: () {
+                            fan2On = !fan2On;
+                            _sendCommand('FAN2:${fan2On ? 'ON' : 'OFF'}');
+                            setState(() {});
+                          },
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: ElevatedButton(
+                          style: ElevatedButton.styleFrom(backgroundColor: fan3On ? Colors.green : Colors.grey),
+                          child: Text('FAN3\n${fan3On ? 'OFF' : 'ON'}', textAlign: TextAlign.center),
+                          onPressed: () {
+                            fan3On = !fan3On;
+                            _sendCommand('FAN3:${fan3On ? 'ON' : 'OFF'}');
+                            setState(() {});
+                          },
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 12),
+                // HEATER and DEHUM Controls
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 16.0),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: ElevatedButton(
+                          style: ElevatedButton.styleFrom(backgroundColor: heaterOn ? Colors.orange : Colors.grey),
+                          child: Text(heaterOn ? 'HEATER+FAN1\nOFF' : 'HEATER+FAN1\nON', textAlign: TextAlign.center),
                           onPressed: () {
                             heaterOn = !heaterOn;
-                            String cmd = 'HEATER:${heaterOn ? 'ON' : 'OFF'}';
-                            _sendCommand(cmd);
+                            String action = heaterOn ? 'ON' : 'OFF';
+                            
+                            // Send HEATER command
+                            _sendCommand('HEATER:$action');
+                            
+                            // Also control FAN1 (delay to ensure commands don't collide)
+                            Future.delayed(Duration(milliseconds: 200), () {
+                              _sendCommand('FAN1:$action');
+                              // Update FAN1 button state to match
+                              setState(() {
+                                fan1On = heaterOn;
+                              });
+                            });
+                            
                             setState(() {});
                           },
                         ),
@@ -441,7 +558,8 @@ class _DashboardState extends State<Dashboard> {
                       const SizedBox(width: 12),
                       Expanded(
                         child: ElevatedButton(
-                          child: Text(dehumOn ? 'DEHUM OFF' : 'DEHUM ON'),
+                          style: ElevatedButton.styleFrom(backgroundColor: dehumOn ? Colors.blue : Colors.grey),
+                          child: Text(dehumOn ? 'DEHUM\nOFF' : 'DEHUM\nON', textAlign: TextAlign.center),
                           onPressed: () {
                             dehumOn = !dehumOn;
                             String cmd = 'DEHUM:${dehumOn ? 'ON' : 'OFF'}';

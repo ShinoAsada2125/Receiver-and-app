@@ -55,7 +55,7 @@ const char* BLE_DEVICE_NAME = "LoRaReceiver";
 // ================================================================================
 bool initializeLoRa();
 void checkIncomingLoRaData();
-void checkSerialCommands();
+
 String convertToJSON(const String& loraData);
 void parseCSVData(const String& data, float values[], int& count);
 void sendLoRaCommand(const String& command);
@@ -90,18 +90,18 @@ void bleNotify(const String &msg) {
 }
 
 // BLE Server callbacks for connection monitoring
+// CRITICAL: NimBLE 2.x API - signatures MUST match exactly or callbacks are silently ignored!
 class BleServerCallbacks : public NimBLEServerCallbacks {
-  void onConnect(NimBLEServer* pServer, ble_gap_conn_desc* desc) {
+  void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {
     Serial.println("✓ BLE CLIENT CONNECTED");
-    Serial.printf("  Client: %s\n", NimBLEAddress(desc->peer_ota_addr).toString().c_str());
+    Serial.printf("  Client: %s\n", connInfo.getAddress().toString().c_str());
   }
   
-  void onDisconnect(NimBLEServer* pServer) {
-    Serial.println("✗ BLE CLIENT DISCONNECTED");
+  void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override {
+    Serial.printf("✗ BLE CLIENT DISCONNECTED (reason: %d)\n", reason);
     Serial.println("  Restarting BLE advertising...");
     
     // CRITICAL: Restart advertising after disconnect
-    // This fixes the issue where device disappears from scan list
     NimBLEAdvertising* pAdv = NimBLEDevice::getAdvertising();
     if (pAdv != nullptr) {
       pAdv->stop();
@@ -113,11 +113,25 @@ class BleServerCallbacks : public NimBLEServerCallbacks {
 };
 
 class BleRxCallbacks: public NimBLECharacteristicCallbacks {
-  void onWrite(NimBLECharacteristic* pChr) {
+  // CRITICAL: NimBLE 2.x requires NimBLEConnInfo& parameter!
+  // Old 1.x signature void onWrite(NimBLECharacteristic*) is SILENTLY IGNORED in 2.x!
+  void onWrite(NimBLECharacteristic* pChr, NimBLEConnInfo& connInfo) override {
+    Serial.println("\n========== BLE WRITE CALLBACK TRIGGERED ==========");
+    Serial.printf("   From client: %s\n", connInfo.getAddress().toString().c_str());
+    Serial.printf("   Characteristic UUID: %s\n", pChr->getUUID().toString().c_str());
+    
     std::string s = pChr->getValue();
-    if (s.length() == 0) return;
+    Serial.printf("   Raw length: %d bytes\n", s.length());
+    
+    if (s.length() == 0) {
+      Serial.println("   ❌ Empty payload - ignoring");
+      bleNotify("REJECT:EMPTY:No data received");
+      return;
+    }
+    
     String cmd = String(s.c_str());
     cmd.trim();
+    Serial.printf("   Parsed command: [%s] (%d chars)\n", cmd.c_str(), cmd.length());
     
     Serial.println("📲 BLE RX: " + cmd);
     
@@ -134,15 +148,18 @@ class BleRxCallbacks: public NimBLECharacteristicCallbacks {
     device.trim();
     action.trim();
     
-    // Log the parsed command
     Serial.printf("   Device: %s | Action: %s\n", device.c_str(), action.c_str());
     
     // Forward the exact command to transmitter via LoRa
+    Serial.println("   📡 Forwarding command via LoRa...");
     sendLoRaCommand(cmd);
     
     // Notify app that it was forwarded
     String ack = "FORWARDED:" + cmd;
+    Serial.println("   📤 Sending BLE acknowledgment: " + ack);
     bleNotify(ack);
+    
+    Serial.println("=========================================\n");
   }
 };
 
@@ -213,14 +230,28 @@ void setup() {
   NimBLEDevice::init(BLE_DEVICE_NAME);
   NimBLEDevice::setPower(ESP_PWR_LVL_P7); // Max power for better advertising range
   
+  // CRITICAL: Disable security to prevent pairing issues blocking writes
+  NimBLEDevice::setSecurityAuth(false, false, false);
+  NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
+  
+  // CRITICAL: Delete all bonds to force Android to re-discover GATT table
+  // This fixes the stale GATT cache issue where writes go to wrong handle
+  NimBLEDevice::deleteAllBonds();
+  Serial.println("✓ BLE bonds cleared (forces GATT rediscovery)");
+  
   pBleServer = NimBLEDevice::createServer();
   pBleServer->setCallbacks(new BleServerCallbacks()); // Monitor connections/disconnections
   
   // Create service
   NimBLEService* pSvc = pBleServer->createService("6E400001-B5A3-F393-E0A9-E50E24DCCA9E");
   pBleTx = pSvc->createCharacteristic("6E400003-B5A3-F393-E0A9-E50E24DCCA9E", NIMBLE_PROPERTY::NOTIFY);
-  pBleRx = pSvc->createCharacteristic("6E400002-B5A3-F393-E0A9-E50E24DCCA9E", NIMBLE_PROPERTY::WRITE);
+  
+  // CRITICAL FIX: Support BOTH write types for maximum compatibility
+  pBleRx = pSvc->createCharacteristic("6E400002-B5A3-F393-E0A9-E50E24DCCA9E", 
+                                       NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
   pBleRx->setCallbacks(new BleRxCallbacks());
+  Serial.printf("✓ BLE RX characteristic created (callback addr: %p)\n", pBleRx);
+  
   pSvc->start();
   
   // Configure advertising
@@ -260,49 +291,49 @@ void setup() {
 // ================================================================================
 void loop() {
   unsigned long currentTime = millis();
-  
-  // ===== BLE ADVERTISING WATCHDOG (critical for Android) =====
-  {
-    static unsigned long lastBleWatchdog = 0;
-    if (currentTime - lastBleWatchdog > 8000) {  // Every 15 seconds
-      lastBleWatchdog = currentTime;
-      if (pBleServer && pBleServer->getConnectedCount() == 0) {
-        NimBLEAdvertising* pAdv = NimBLEDevice::getAdvertising();
-        if (pAdv && !pAdv->isAdvertising()) {
-          pAdv->stop();
-          delay(50);
-          pAdv->start();
-          Serial.println("🛡️ BLE watchdog: Forced advertising restart");
-        }
-      }
-    }
+  static unsigned long lastConnCheck = 0;
+if (currentTime - lastConnCheck > 5000) {
+  lastConnCheck = currentTime;
+  if (pBleServer) {
+    Serial.printf("BLE connected clients: %d\n", pBleServer->getConnectedCount());
   }
+}
+  
   
   // 1. Check for incoming LoRa data using DIO0 pin (most reliable)
   if (loraInitialized) {
     checkIncomingLoRaData();
   }
   
-  // 2. Check for Serial commands (from Flutter app)
-  checkSerialCommands();
-  
-  // 3. Print system status every 30 seconds
+  // 2. Print system status every 30 seconds (includes BLE connection count)
   if (currentTime - lastStatusPrint >= 30000) {
     lastStatusPrint = currentTime;
     printSystemStatus();
+    
+    // Show BLE connection status
+    if (pBleServer) {
+      int connCount = pBleServer->getConnectedCount();
+      if (connCount > 0) {
+        Serial.printf("📱 BLE: %d client(s) connected\n", connCount);
+      } else {
+        Serial.println("📱 BLE: No clients connected (advertising active)");
+      }
+    }
   }
   
-  // 4. Check for data timeout (warn if no data for 30+ seconds)
+  // 3. Check for data timeout (warn if no data for 30+ seconds)
   if (currentTime - lastDataReceived >= DATA_TIMEOUT_MS && lastDataReceived > 0) {
-    if (currentTime - lastStatusPrint >= 5000) {
+    static unsigned long lastWarning = 0;
+    // Only warn every 30 seconds (not every 5 seconds - reduces spam)
+    if (currentTime - lastWarning >= 30000) {
       Serial.println("⚠️ WARNING: No LoRa data received for " + 
                      String((currentTime - lastDataReceived) / 1000) + " seconds");
-      lastStatusPrint = currentTime;
+      lastWarning = currentTime;
       
       // Restart receiver if timeout occurs
       if (loraInitialized) {
+        Serial.println("   🔄 Restarting receiver mode...");
         radio.startReceive();
-        Serial.println("   Receiver restarted");
       }
     }
   }
@@ -373,12 +404,16 @@ void checkIncomingLoRaData() {
   // Method 1: Check DIO0 pin (most reliable for SX1278)
   if (digitalRead(LORA_DIO0) == HIGH) {
     // ⚠️ FIX #4: CORRECT RadioLib API for SX1278 (was using invalid receive() method)
-    uint8_t buf[256];
+    uint8_t buf[256] = {0};  // CRITICAL: Zero-initialize to prevent garbage after actual data
     int state = radio.readData(buf, 255);  // MUST use buffer + length
     
     if (state == RADIOLIB_ERR_NONE) {
-      buf[255] = 0;  // Null-terminate
+      // Use getPacketLength() to properly null-terminate (prevents garbage bytes in JSON)
+      size_t pktLen = radio.getPacketLength();
+      if (pktLen < 256) buf[pktLen] = 0;
+      else buf[255] = 0;
       String loraData = String((char*)buf);
+      loraData.trim();  // Remove any trailing whitespace/newlines
       
       // Update timing and counters
       lastDataReceived = millis();
@@ -414,9 +449,11 @@ void checkIncomingLoRaData() {
       }
        else if (loraData.startsWith("ACKCMD:")) {
         // Command ACK from transmitter - forward structured JSON
+        // CRITICAL: Use escapeJsonString() to prevent control characters in JSON!
+        String safeRaw = escapeJsonString(loraData);
         String json = "{";
         json += "\"type\":\"ackcmd\",";
-        json += "\"raw\":\"" + loraData + "\",";
+        json += "\"raw\":\"" + safeRaw + "\",";
         json += "\"timestamp\":" + String(millis() / 1000) + ",";
         json += "\"rssi\":" + String(rssi, 1) + ",";
         json += "\"snr\":" + String(snr, 1);
@@ -437,8 +474,8 @@ void checkIncomingLoRaData() {
         }
         String json = "{";
         json += "\"type\":\"reject\",";
-        json += "\"command\":\"" + cmdStr + "\",";
-        json += "\"reason\":\"" + reason + "\",";
+        json += "\"command\":\"" + escapeJsonString(cmdStr) + "\",";
+        json += "\"reason\":\"" + escapeJsonString(reason) + "\",";
         json += "\"timestamp\":" + String(millis() / 1000) + ",";
         json += "\"rssi\":" + String(rssi, 1) + ",";
         json += "\"snr\":" + String(snr, 1);
@@ -447,9 +484,10 @@ void checkIncomingLoRaData() {
         bleNotify(json);
       } else {
         // Other non-sensor messages - forward as simple JSON
+        String safeRaw = escapeJsonString(loraData);
         String msg = "{";
         msg += "\"type\":\"message\",";
-        msg += "\"raw\":\"" + loraData + "\",";
+        msg += "\"raw\":\"" + safeRaw + "\",";
         msg += "\"timestamp\":" + String(millis() / 1000) + ",";
         msg += "\"rssi\":" + String(rssi, 1) + ",";
         msg += "\"snr\":" + String(snr, 1);
@@ -479,49 +517,7 @@ void checkIncomingLoRaData() {
 // ================================================================================
 // SECTION 10: SERIAL COMMAND HANDLING
 // ================================================================================
-void checkSerialCommands() {
-  if (Serial.available()) {
-    String command = Serial.readStringUntil('\n');
-    command.trim();
-    
-    if (command.length() > 0) {
-      Serial.println("\n" + String(millis() / 1000) + "s: 📤 Serial Command Received");
-      Serial.println("   Command: " + command);
-      
-      // Validate command format
-      if (command.startsWith("GPIO") && command.indexOf('=') > 4) {
-        // Forward command to primary ESP32 via LoRa
-        sendLoRaCommand(command);
-        
-        // Confirm to Serial
-        Serial.println("   ✅ Command forwarded via LoRa");
-        // Notify BLE client
-        bleNotify("FORWARDED:" + command);
-      } else {
-        // Handle special commands
-        if (command.equalsIgnoreCase("STATUS")) {
-          printSystemStatus();
-        } 
-        else if (command.equalsIgnoreCase("RSSI")) {
-          float currentRSSI = radio.getRSSI();
-          float currentSNR = radio.getSNR();
-          Serial.printf("   📶 Current RSSI: %.1f dBm | SNR: %.1f dB\n", currentRSSI, currentSNR);
-        }
-        else if (command.equalsIgnoreCase("RESET")) {
-          packetCounter = 0;
-          failedPackets = 0;
-          Serial.println("   ✅ Counters reset");
-        } else if (command.equalsIgnoreCase("RESTART")) {
-          radio.startReceive();
-          Serial.println("   ✅ Receiver restarted");
-        } else {
-          // Forward as-is
-          sendLoRaCommand(command);
-        }
-      }
-    }
-  }
-}
+
 
 // ================================================================================
 // SECTION 11: DATA CONVERSION FUNCTIONS
@@ -609,49 +605,56 @@ void sendLoRaCommand(const String& command) {
     return;
   }
   
-  int retryCount = 0;
-  int state = RADIOLIB_ERR_UNKNOWN;
-  
-  // Convert String to C-string for RadioLib
-  String cmdWithNewline = command + "\n";  // Add newline
-  const char* cmd_cstr = cmdWithNewline.c_str();
-  Serial.printf("\n📤 LoRa TX COMMAND: [%s] (%d bytes)\n", cmd_cstr, command.length());
-  
-  // Stop receive mode before transmitting
-  radio.standby();
-  
-  // Retry logic
-  while (retryCount < MAX_RETRY_COUNT) {
-    state = radio.transmit(cmd_cstr);
+  // Send the command TWICE to combat half-duplex timing collisions
+  // (Transmitter ignores duplicates within 5-second window)
+  for (int attempt = 0; attempt < 2; attempt++) {
+    if (attempt > 0) {
+      // Wait before resending - give transmitter time to finish any TX/ACK
+      Serial.println("   ⏳ Waiting 1.2s before resend...");
+      delay(1200);
+    }
     
-    if (state == RADIOLIB_ERR_NONE) {
-      // Success
-      Serial.printf("   ✅ Command sent (RSSI: %d dBm, SNR: %.1f dB)\n", 
-                    radio.getRSSI(), radio.getSNR());
-      // Notify BLE
-      bleNotify(String("SENT:") + command);
+    int retryCount = 0;
+    int state = RADIOLIB_ERR_UNKNOWN;
+    
+    // Convert String to C-string for RadioLib (NO newline - cleaner parsing)
+    const char* cmd_cstr = command.c_str();
+    Serial.printf("\n📤 LoRa TX COMMAND [%d/2]: [%s] (%d bytes)\n", attempt + 1, cmd_cstr, command.length());
+    Serial.println("   🛑 Stopping receiver mode (standby)");
+    
+    // CRITICAL: Stop receive mode before transmitting (prioritize command)
+    radio.standby();
+    delay(10);  // Give radio time to switch modes
+    
+    // Retry logic (for radio TX errors, not application-level retries)
+    while (retryCount < MAX_RETRY_COUNT) {
+      state = radio.transmit(cmd_cstr);
       
-      // Restart receive mode
-      radio.startReceive();
-      return;
+      if (state == RADIOLIB_ERR_NONE) {
+        Serial.printf("   ✅ Command sent [%d/2]\n", attempt + 1);
+        break;
+      }
+      
+      retryCount++;
+      if (retryCount < MAX_RETRY_COUNT) {
+        Serial.printf("   ⚠️ Radio retry %d/%d after error: %d\n", 
+                      retryCount, MAX_RETRY_COUNT, state);
+        delay(100 * retryCount);
+      }
     }
     
-    retryCount++;
-    if (retryCount < MAX_RETRY_COUNT) {
-      Serial.printf("   ⚠️ Retry %d/%d after error: %d\n", 
-                    retryCount, MAX_RETRY_COUNT, state);
-      delay(100 * retryCount);
+    if (state != RADIOLIB_ERR_NONE) {
+      Serial.printf("   ❌ TX failed on attempt %d (Error: %d)\n", attempt + 1, state);
     }
+    
+    // Restart receive mode between attempts
+    radio.startReceive();
   }
   
-  // Failed after retries
-  Serial.printf("   ❌ Failed to send after %d retries (Error: %d)\n", 
-                MAX_RETRY_COUNT, state);
-  // Notify BLE of failure
-  bleNotify(String("SEND_FAILED:") + String(state));
-  
-  // Always restart receive mode
-  radio.startReceive();
+  // Notify BLE after both sends complete
+  String ack = "SENT:" + command;
+  Serial.println("   📱 BLE ACK: " + ack);
+  bleNotify(ack);
 }
 
 // ================================================================================
