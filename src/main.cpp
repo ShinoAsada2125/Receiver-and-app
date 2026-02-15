@@ -57,6 +57,7 @@ bool initializeLoRa();
 void checkIncomingLoRaData();
 
 String convertToJSON(const String& loraData);
+String escapeJsonString(const String& str);
 void parseCSVData(const String& data, float values[], int& count);
 void sendLoRaCommand(const String& command);
 void printSystemStatus();
