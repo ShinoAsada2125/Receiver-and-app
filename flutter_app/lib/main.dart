@@ -70,6 +70,7 @@ class _MyAppState extends State<MyApp> {
     );
   }
 }
+
 class DashboardPage extends StatefulWidget {
   final bool isDark;
   final VoidCallback onToggleTheme;
@@ -87,6 +88,7 @@ class _DashboardPageState extends State<DashboardPage> with TickerProviderStateM
 
   String? _deviceId;
   bool _connected = false;
+  bool _scanning = false;
   String _status = 'Idle';
   int _currentTab = 0;
 
@@ -111,6 +113,8 @@ class _DashboardPageState extends State<DashboardPage> with TickerProviderStateM
   Color get _textSecondary => widget.isDark ? AppColors.textSecondary : AppColorsLight.textSecondary;
   Color get _navBar => widget.isDark ? AppColors.navBar : AppColorsLight.navBar;
   Color get _accent => AppColors.accent;
+  double? get _rssiValue => (sensor['rssi'] as num?)?.toDouble();
+  double? get _snrValue => (sensor['snr'] as num?)?.toDouble();
 
   @override
   void initState() {
@@ -187,12 +191,19 @@ class _DashboardPageState extends State<DashboardPage> with TickerProviderStateM
     }
   }
 
+  void _stopScan() {
+    _scanSub?.cancel();
+    _scanSub = null;
+    setState(() { _scanning = false; _status = 'Idle'; });
+    _logAdd('Scan stopped by user');
+  }
+
   void _startScan() {
     _scanSub?.cancel();
     _scanSub = null;
     _ble.statusStream.firstWhere((status) => status == BleStatus.ready).then((_) {
       _logAdd('Scanning for LoRaReceiver...');
-      setState(() => _status = 'Scanning...');
+      setState(() { _status = 'Scanning...'; _scanning = true; });
       _scanSub = _ble.scanForDevices(withServices: [serviceUuid], scanMode: ScanMode.lowLatency).listen((device) {
         String name = device.name.isNotEmpty ? device.name : 'N/A';
         if ((_deviceId == null) && name == bleDeviceName) {
@@ -218,14 +229,18 @@ class _DashboardPageState extends State<DashboardPage> with TickerProviderStateM
             if (_scanSub != null && _deviceId == null) {
               _scanSub?.cancel(); _scanSub = null;
               _logAdd('Scan failed - retrying...');
-              Future.delayed(const Duration(seconds: 2), () { if (!_connected) _startScan(); });
+              if (_scanning) {
+                Future.delayed(const Duration(seconds: 2), () { if (!_connected && _scanning) _startScan(); });
+              }
             }
           });
         }
       });
     }).catchError((e) {
       _logAdd('BLE not ready: $e');
-      Future.delayed(const Duration(seconds: 2), () { if (!_connected) _startScan(); });
+      if (_scanning) {
+        Future.delayed(const Duration(seconds: 2), () { if (!_connected && _scanning) _startScan(); });
+      }
     });
   }
 
@@ -237,8 +252,15 @@ class _DashboardPageState extends State<DashboardPage> with TickerProviderStateM
         try { await _ble.clearGattCache(id); _logAdd('GATT cache cleared'); }
         catch (e) { _logAdd('GATT cache clear failed: $e'); }
         await Future.delayed(const Duration(milliseconds: 500));
-        setState(() { _connected = true; _status = 'Connected'; });
+        setState(() { _connected = true; _scanning = false; _status = 'Connected'; });
         _startNotify(id);
+        // Request current device states from transmitter after BLE is ready
+        Future.delayed(const Duration(seconds: 2), () {
+          if (_connected) {
+            _sendCommand('GETSTATE');
+            _logAdd('Requesting device states...');
+          }
+        });
       } else if (event.connectionState == DeviceConnectionState.disconnected) {
         _logAdd('Disconnected');
         setState(() { _connected = false; _status = 'Disconnected'; });
@@ -286,15 +308,22 @@ class _DashboardPageState extends State<DashboardPage> with TickerProviderStateM
               _logAdd('ACK: ${m['raw'] ?? ''} (RSSI: ${m['rssi']})');
             } else if (msgType == 'reject') {
               _logAdd('REJECTED: ${m['command'] ?? ''} - ${m['reason'] ?? ''}');
+            } else if (msgType == 'devstate') {
+              setState(() {
+                fan1On = m['fan1'] == true;
+                fan2On = m['fan2'] == true;
+                fan3On = m['fan3'] == true;
+                heaterOn = m['heater'] == true;
+                dehumOn = m['dehum'] == true;
+                _tankFull = m['tank_full'] == true;
+                sensor['tank_full'] = _tankFull;
+                _masterOn = fan1On && fan2On && fan3On && heaterOn && dehumOn;
+              });
+              _logAdd('Device states synced');
             } else if (msgType == 'status') {
               bool isFull = m['tank_full'] == true;
               _logAdd(isFull ? 'TANK FULL - All devices shut down!' : 'TANK OK - Devices restored');
-              if (isFull && !_tankFull) _showTankFullNotification();
-              setState(() {
-                _tankFull = isFull; sensor['tank_full'] = isFull;
-                if (isFull) { fan1On = false; fan2On = false; fan3On = false; heaterOn = false; dehumOn = false; _masterOn = false; }
-                else { fan1On = true; fan2On = true; fan3On = true; heaterOn = true; dehumOn = true; _masterOn = true; }
-              });
+              _applyTankFullState(isFull);
             } else { _logAdd('Message: ${m['raw'] ?? sanitized}'); }
             setState(() {
               sensor['rssi'] = (m['rssi'] as num?)?.toDouble() ?? sensor['rssi'];
@@ -311,12 +340,7 @@ class _DashboardPageState extends State<DashboardPage> with TickerProviderStateM
               sensor['percent'] = (m['percent'] as num?)?.toDouble() ?? sensor['percent'] ?? 0.0;
               sensor['packet'] = m['packet'] ?? sensor['packet'] ?? 0;
               sensor['tank_full'] = m['tank_full'] ?? sensor['tank_full'] ?? false;
-              bool newTankFull = sensor['tank_full'] == true;
-              if (newTankFull != _tankFull) {
-                _tankFull = newTankFull;
-                if (_tankFull) { fan1On = false; fan2On = false; fan3On = false; heaterOn = false; dehumOn = false; _masterOn = false; _showTankFullNotification(); }
-                else { fan1On = true; fan2On = true; fan3On = true; heaterOn = true; dehumOn = true; _masterOn = true; }
-              }
+              _applyTankFullState(sensor['tank_full'] == true);
               sensor['rssi'] = (m['rssi'] as num?)?.toDouble() ?? sensor['rssi'] ?? 0.0;
               sensor['snr'] = (m['snr'] as num?)?.toDouble() ?? sensor['snr'] ?? 0.0;
               sensor['timestamp'] = DateTime.now().toIso8601String();
@@ -345,6 +369,30 @@ class _DashboardPageState extends State<DashboardPage> with TickerProviderStateM
     }
     if (_messageBuffer.length > 500) { _messageBuffer = ''; }
   }
+  // Centralized tank-full state handler (prevents duplicate logic)
+  void _applyTankFullState(bool isFull) {
+    if (isFull && !_tankFull) _showTankFullNotification();
+    setState(() {
+      _tankFull = isFull;
+      sensor['tank_full'] = isFull;
+      if (isFull) {
+        fan1On = false; fan2On = false; fan3On = false;
+        heaterOn = false; dehumOn = false; _masterOn = false;
+      } else {
+        fan1On = true; fan2On = true; fan3On = true;
+        heaterOn = true; dehumOn = true; _masterOn = true;
+      }
+    });
+  }
+
+  // Centralized device toggle (prevents duplicate callbacks)
+  void _toggleDevice(String cmd, bool current, void Function(bool) setter) {
+    if (_tankFull || !_connected) return;
+    final newState = !current;
+    setState(() => setter(newState));
+    _sendCommand('$cmd:${newState ? 'ON' : 'OFF'}');
+  }
+
   void _sendCommand(String cmd) async {
     if (!_connected || _deviceId == null) { _logAdd('Not connected'); return; }
     if (cmd.isEmpty) return;
@@ -359,7 +407,7 @@ class _DashboardPageState extends State<DashboardPage> with TickerProviderStateM
   }
 
   void _masterToggle() {
-    if (_tankFull) return;
+    if (_tankFull || !_connected) return;
     _masterOn = !_masterOn;
     String action = _masterOn ? 'ON' : 'OFF';
     _sendCommand('FAN1:$action');
@@ -387,23 +435,25 @@ class _DashboardPageState extends State<DashboardPage> with TickerProviderStateM
 
   // Signal helpers
   String _signalLabel() {
-    double? rssi = (sensor['rssi'] as num?)?.toDouble();
+    final rssi = _rssiValue;
     if (rssi == null || !_connected) return 'No Signal';
     if (rssi > -60) return 'Strong';
     if (rssi > -80) return 'Moderate';
     if (rssi > -100) return 'Weak';
     return 'No Signal';
   }
+
   Color _signalColor() {
-    double? rssi = (sensor['rssi'] as num?)?.toDouble();
+    final rssi = _rssiValue;
     if (rssi == null || !_connected) return AppColors.alertRed;
     if (rssi > -60) return AppColors.activeGreen;
     if (rssi > -80) return AppColors.amber;
     if (rssi > -100) return Colors.orange;
     return AppColors.alertRed;
   }
+
   int _signalBars() {
-    double? rssi = (sensor['rssi'] as num?)?.toDouble();
+    final rssi = _rssiValue;
     if (rssi == null || !_connected) return 0;
     if (rssi > -60) return 4;
     if (rssi > -75) return 3;
@@ -447,7 +497,7 @@ class _DashboardPageState extends State<DashboardPage> with TickerProviderStateM
     return Container(
       decoration: BoxDecoration(
         color: _navBar,
-        border: Border(top: BorderSide(color: _accent.withOpacity(0.15), width: 0.5)),
+        border: Border(top: BorderSide(color: _accent.withValues(alpha: 0.15), width: 0.5)),
       ),
       padding: const EdgeInsets.only(top: 8, bottom: 12),
       child: Row(
@@ -460,7 +510,7 @@ class _DashboardPageState extends State<DashboardPage> with TickerProviderStateM
             child: AnimatedContainer(
               duration: const Duration(milliseconds: 200),
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
-              decoration: sel ? BoxDecoration(color: _textPrimary.withOpacity(0.08), borderRadius: BorderRadius.circular(20)) : null,
+              decoration: sel ? BoxDecoration(color: _textPrimary.withValues(alpha: 0.08), borderRadius: BorderRadius.circular(20)) : null,
               child: Column(mainAxisSize: MainAxisSize.min, children: [
                 Icon(items[i][1] as IconData, size: 24, color: sel ? _textPrimary : _accent),
                 const SizedBox(height: 4),
@@ -486,21 +536,30 @@ class _DashboardPageState extends State<DashboardPage> with TickerProviderStateM
         ),
         const SizedBox(width: 8),
         GestureDetector(
-          onTap: () { if (_connected) _disconnect(); else _startScan(); },
+          onTap: () {
+            if (_connected) { _disconnect(); }
+            else if (_scanning) { _stopScan(); }
+            else { _startScan(); }
+          },
           child: Container(
             padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
             decoration: BoxDecoration(
-              color: _connected ? AppColors.activeGreen.withOpacity(0.15) : _card,
+              color: _connected ? AppColors.activeGreen.withValues(alpha: 0.15)
+                   : _scanning ? AppColors.amber.withValues(alpha: 0.15) : _card,
               borderRadius: BorderRadius.circular(12),
-              border: Border.all(color: _connected ? AppColors.activeGreen.withOpacity(0.4) : _accent.withOpacity(0.2)),
+              border: Border.all(color: _connected ? AppColors.activeGreen.withValues(alpha: 0.4)
+                   : _scanning ? AppColors.amber.withValues(alpha: 0.4) : _accent.withValues(alpha: 0.2)),
             ),
             child: Row(mainAxisSize: MainAxisSize.min, children: [
               AnimatedBuilder(animation: _pulseController, builder: (ctx, _) {
                 return Container(width: 8, height: 8, decoration: BoxDecoration(shape: BoxShape.circle,
-                  color: _connected ? AppColors.activeGreen.withOpacity(0.5 + _pulseController.value * 0.5) : AppColors.alertRed.withOpacity(0.5 + _pulseController.value * 0.5)));
+                  color: _connected ? AppColors.activeGreen.withValues(alpha: 0.5 + _pulseController.value * 0.5)
+                       : _scanning ? AppColors.amber.withValues(alpha: 0.5 + _pulseController.value * 0.5)
+                       : AppColors.alertRed.withValues(alpha: 0.5 + _pulseController.value * 0.5)));
               }),
               const SizedBox(width: 8),
-              Text(_connected ? 'Connected' : 'Scan', style: TextStyle(color: _textPrimary, fontSize: 13, fontWeight: FontWeight.w500)),
+              Text(_connected ? 'Connected' : _scanning ? 'Stop' : 'Scan',
+                style: TextStyle(color: _textPrimary, fontSize: 13, fontWeight: FontWeight.w500)),
             ]),
           ),
         ),
@@ -511,17 +570,23 @@ class _DashboardPageState extends State<DashboardPage> with TickerProviderStateM
       if (_tankFull) _buildTankFullBanner(),
       _buildSignalBadge(),
       const SizedBox(height: 16),
-      // 2x2 stat cards
+      // Stat cards
       Row(children: [
-        Expanded(child: _buildStatCard('Temperature', '${_fmt(sensor['temp1'])}\u00B0C', Icons.thermostat_rounded, Colors.orange)),
+        Expanded(child: _buildStatCard('Temp (Outside)', '${_fmt(sensor['temp1'])}\u00B0C', Icons.thermostat_rounded, Colors.orange)),
         const SizedBox(width: 12),
-        Expanded(child: _buildStatCard('Humidity', '${_fmt(sensor['humid1'])}%', Icons.water_drop_rounded, Colors.lightBlue)),
+        Expanded(child: _buildStatCard('Humid (Outside)', '${_fmt(sensor['humid1'])}%', Icons.water_drop_rounded, Colors.lightBlue)),
+      ]),
+      const SizedBox(height: 12),
+      Row(children: [
+        Expanded(child: _buildStatCard('Temp (Chamber)', '${_fmt(sensor['temp2'])}\u00B0C', Icons.thermostat_rounded, Colors.deepOrange)),
+        const SizedBox(width: 12),
+        Expanded(child: _buildStatCard('Humid (Chamber)', '${_fmt(sensor['humid2'])}%', Icons.water_drop_rounded, Colors.blue)),
       ]),
       const SizedBox(height: 12),
       Row(children: [
         Expanded(child: _buildStatCard('Volume', '${_fmt(sensor['volume'])} L', Icons.waves_rounded, Colors.cyan)),
         const SizedBox(width: 12),
-        Expanded(child: _buildStatCard('Tank', _tankFull ? 'FULL' : 'OK', _tankFull ? Icons.warning_rounded : Icons.check_circle_rounded, _tankFull ? AppColors.alertRed : AppColors.activeGreen)),
+        Expanded(child: _buildStatCard('Tank', _connected ? (_tankFull ? 'FULL' : 'OK') : '--', _tankFull && _connected ? Icons.warning_rounded : _connected ? Icons.check_circle_rounded : Icons.remove_circle_outline_rounded, _connected ? (_tankFull ? AppColors.alertRed : AppColors.activeGreen) : _accent)),
       ]),
       const SizedBox(height: 20),
       Text('Quick Controls', style: TextStyle(color: _textPrimary, fontSize: 16, fontWeight: FontWeight.w600)),
@@ -534,7 +599,7 @@ class _DashboardPageState extends State<DashboardPage> with TickerProviderStateM
     return Container(
       margin: const EdgeInsets.only(bottom: 16),
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-      decoration: BoxDecoration(color: AppColors.alertRed.withOpacity(0.15), borderRadius: BorderRadius.circular(16), border: Border.all(color: AppColors.alertRed.withOpacity(0.4))),
+      decoration: BoxDecoration(color: AppColors.alertRed.withValues(alpha: 0.15), borderRadius: BorderRadius.circular(16), border: Border.all(color: AppColors.alertRed.withValues(alpha: 0.4))),
       child: Row(children: [
         Icon(Icons.warning_amber_rounded, color: AppColors.alertRed, size: 28),
         const SizedBox(width: 12),
@@ -555,8 +620,8 @@ class _DashboardPageState extends State<DashboardPage> with TickerProviderStateM
         const SizedBox(width: 12),
         Text(_signalLabel(), style: TextStyle(color: _signalColor(), fontWeight: FontWeight.w600, fontSize: 13)),
         const Spacer(),
-        if (sensor['rssi'] != null)
-          Text('${(sensor['rssi'] as num).toStringAsFixed(0)} dBm', style: TextStyle(color: _textSecondary, fontSize: 12)),
+        if (_rssiValue != null)
+          Text('${_rssiValue!.toStringAsFixed(0)} dBm', style: TextStyle(color: _textSecondary, fontSize: 12)),
       ]),
     );
   }
@@ -565,7 +630,7 @@ class _DashboardPageState extends State<DashboardPage> with TickerProviderStateM
     return Row(crossAxisAlignment: CrossAxisAlignment.end, children: List.generate(4, (i) {
       double h = height * (0.3 + 0.175 * i);
       return Container(width: 4, height: h, margin: const EdgeInsets.only(right: 2),
-        decoration: BoxDecoration(color: i < bars ? color : _accent.withOpacity(0.2), borderRadius: BorderRadius.circular(2)));
+        decoration: BoxDecoration(color: i < bars ? color : _accent.withValues(alpha: 0.2), borderRadius: BorderRadius.circular(2)));
     }));
   }
 
@@ -582,29 +647,34 @@ class _DashboardPageState extends State<DashboardPage> with TickerProviderStateM
   }
 
   Widget _buildQuickControls() {
-    return Wrap(spacing: 8, runSpacing: 8, children: [
-      _qToggle('FAN1', fan1On, Icons.air_rounded, () { if (_tankFull) return; setState(() => fan1On = !fan1On); _sendCommand('FAN1:${fan1On ? 'ON' : 'OFF'}'); }),
-      _qToggle('FAN2', fan2On, Icons.air_rounded, () { if (_tankFull) return; setState(() => fan2On = !fan2On); _sendCommand('FAN2:${fan2On ? 'ON' : 'OFF'}'); }),
-      _qToggle('FAN3', fan3On, Icons.air_rounded, () { if (_tankFull) return; setState(() => fan3On = !fan3On); _sendCommand('FAN3:${fan3On ? 'ON' : 'OFF'}'); }),
-      _qToggle('HTR', heaterOn, Icons.local_fire_department_rounded, () { if (_tankFull) return; setState(() => heaterOn = !heaterOn); _sendCommand('HEATER:${heaterOn ? 'ON' : 'OFF'}'); }),
-      _qToggle('DHM', dehumOn, Icons.opacity_rounded, () { if (_tankFull) return; setState(() => dehumOn = !dehumOn); _sendCommand('DEHUM:${dehumOn ? 'ON' : 'OFF'}'); }),
+    return Row(children: [
+      Expanded(child: _qToggle('FAN1', fan1On, Icons.air_rounded, () => _toggleDevice('FAN1', fan1On, (v) => fan1On = v))),
+      const SizedBox(width: 6),
+      Expanded(child: _qToggle('FAN2', fan2On, Icons.air_rounded, () => _toggleDevice('FAN2', fan2On, (v) => fan2On = v))),
+      const SizedBox(width: 6),
+      Expanded(child: _qToggle('FAN3', fan3On, Icons.air_rounded, () => _toggleDevice('FAN3', fan3On, (v) => fan3On = v))),
+      const SizedBox(width: 6),
+      Expanded(child: _qToggle('HTR', heaterOn, Icons.local_fire_department_rounded, () => _toggleDevice('HEATER', heaterOn, (v) => heaterOn = v))),
+      const SizedBox(width: 6),
+      Expanded(child: _qToggle('DHM', dehumOn, Icons.opacity_rounded, () => _toggleDevice('DEHUM', dehumOn, (v) => dehumOn = v))),
     ]);
   }
 
   Widget _qToggle(String label, bool on, IconData icon, VoidCallback onTap) {
     bool locked = _tankFull;
+    bool disabled = !_connected;
     return GestureDetector(
-      onTap: locked ? null : onTap,
-      child: Container(width: 64, padding: const EdgeInsets.symmetric(vertical: 10),
+      onTap: (locked || disabled) ? null : onTap,
+      child: Container(padding: const EdgeInsets.symmetric(vertical: 8),
         decoration: BoxDecoration(
-          color: locked ? AppColors.alertRed.withOpacity(0.1) : on ? AppColors.activeGreen.withOpacity(0.12) : _card,
-          borderRadius: BorderRadius.circular(14),
-          border: Border.all(color: locked ? AppColors.alertRed.withOpacity(0.3) : on ? AppColors.activeGreen.withOpacity(0.4) : _accent.withOpacity(0.12)),
+          color: disabled ? _card.withValues(alpha: 0.5) : locked ? AppColors.alertRed.withValues(alpha: 0.1) : on ? AppColors.activeGreen.withValues(alpha: 0.12) : _card,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: disabled ? _accent.withValues(alpha: 0.08) : locked ? AppColors.alertRed.withValues(alpha: 0.3) : on ? AppColors.activeGreen.withValues(alpha: 0.4) : _accent.withValues(alpha: 0.12)),
         ),
         child: Column(children: [
-          Icon(icon, color: locked ? AppColors.alertRed.withOpacity(0.5) : on ? AppColors.activeGreen : _accent, size: 22),
-          const SizedBox(height: 4),
-          Text(locked ? 'LOCK' : label, style: TextStyle(color: locked ? AppColors.alertRed.withOpacity(0.7) : _textSecondary, fontSize: 10, fontWeight: FontWeight.w600)),
+          Icon(icon, color: disabled ? _accent.withValues(alpha: 0.3) : locked ? AppColors.alertRed.withValues(alpha: 0.5) : on ? AppColors.activeGreen : _accent, size: 20),
+          const SizedBox(height: 3),
+          Text(disabled ? label : locked ? 'LOCK' : label, style: TextStyle(color: disabled ? _accent.withValues(alpha: 0.4) : locked ? AppColors.alertRed.withValues(alpha: 0.7) : _textSecondary, fontSize: 9, fontWeight: FontWeight.w600)),
         ]),
       ),
     );
@@ -619,14 +689,17 @@ class _DashboardPageState extends State<DashboardPage> with TickerProviderStateM
       // Large signal card
       Container(
         padding: const EdgeInsets.all(20),
-        decoration: BoxDecoration(color: _card, borderRadius: BorderRadius.circular(16), border: Border.all(color: _signalColor().withOpacity(0.2))),
+        decoration: BoxDecoration(color: _card, borderRadius: BorderRadius.circular(16), border: Border.all(color: _signalColor().withValues(alpha: 0.2))),
         child: Row(children: [
           _buildSignalBarsWidget(_signalBars(), _signalColor(), 36),
           const SizedBox(width: 20),
           Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
             Text(_signalLabel(), style: TextStyle(color: _signalColor(), fontSize: 18, fontWeight: FontWeight.w700)),
             const SizedBox(height: 4),
-            Text(sensor['rssi'] != null ? '${(sensor['rssi'] as num).toStringAsFixed(0)} dBm  \u2022  SNR ${sensor['snr'] != null ? (sensor['snr'] as num).toStringAsFixed(1) : '-'} dB' : 'No data received yet', style: TextStyle(color: _textSecondary, fontSize: 12)),
+            Text(_rssiValue != null
+              ? '${_rssiValue!.toStringAsFixed(0)} dBm  \u2022  SNR ${_snrValue?.toStringAsFixed(1) ?? '-'} dB'
+              : 'No data received yet',
+              style: TextStyle(color: _textSecondary, fontSize: 12)),
           ])),
         ]),
       ),
@@ -656,8 +729,8 @@ class _DashboardPageState extends State<DashboardPage> with TickerProviderStateM
           const SizedBox(height: 12),
           _metaRow('Packets', '${sensor['packet'] ?? '-'}'),
           _metaRow('Last Update', sensor['timestamp'] != null ? _fmtTime(sensor['timestamp']) : '-'),
-          _metaRow('RSSI', '${sensor['rssi'] != null ? (sensor['rssi'] as num).toStringAsFixed(0) : '-'} dBm'),
-          _metaRow('SNR', '${sensor['snr'] != null ? (sensor['snr'] as num).toStringAsFixed(1) : '-'} dB'),
+          _metaRow('RSSI', '${_rssiValue?.toStringAsFixed(0) ?? '-'} dBm'),
+          _metaRow('SNR', '${_snrValue?.toStringAsFixed(1) ?? '-'} dB'),
         ]),
       ),
     ]);
@@ -703,54 +776,55 @@ class _DashboardPageState extends State<DashboardPage> with TickerProviderStateM
       const SizedBox(height: 12),
       // Fan row
       Row(children: [
-        Expanded(child: _devCard('FAN 1', fan1On, Icons.air_rounded, Colors.teal, () { if (_tankFull) return; setState(() => fan1On = !fan1On); _sendCommand('FAN1:${fan1On ? 'ON' : 'OFF'}'); })),
+        Expanded(child: _devCard('FAN 1', fan1On, Icons.air_rounded, Colors.teal, () => _toggleDevice('FAN1', fan1On, (v) => fan1On = v))),
         const SizedBox(width: 10),
-        Expanded(child: _devCard('FAN 2', fan2On, Icons.air_rounded, Colors.teal, () { if (_tankFull) return; setState(() => fan2On = !fan2On); _sendCommand('FAN2:${fan2On ? 'ON' : 'OFF'}'); })),
+        Expanded(child: _devCard('FAN 2', fan2On, Icons.air_rounded, Colors.teal, () => _toggleDevice('FAN2', fan2On, (v) => fan2On = v))),
         const SizedBox(width: 10),
-        Expanded(child: _devCard('FAN 3', fan3On, Icons.air_rounded, Colors.teal, () { if (_tankFull) return; setState(() => fan3On = !fan3On); _sendCommand('FAN3:${fan3On ? 'ON' : 'OFF'}'); })),
+        Expanded(child: _devCard('FAN 3', fan3On, Icons.air_rounded, Colors.teal, () => _toggleDevice('FAN3', fan3On, (v) => fan3On = v))),
       ]),
       const SizedBox(height: 10),
       Row(children: [
-        Expanded(child: _devCard('HEATER', heaterOn, Icons.local_fire_department_rounded, Colors.orange, () { if (_tankFull) return; setState(() => heaterOn = !heaterOn); _sendCommand('HEATER:${heaterOn ? 'ON' : 'OFF'}'); })),
+        Expanded(child: _devCard('HEATER', heaterOn, Icons.local_fire_department_rounded, Colors.orange, () => _toggleDevice('HEATER', heaterOn, (v) => heaterOn = v))),
         const SizedBox(width: 10),
-        Expanded(child: _devCard('DEHUM', dehumOn, Icons.opacity_rounded, Colors.blue, () { if (_tankFull) return; setState(() => dehumOn = !dehumOn); _sendCommand('DEHUM:${dehumOn ? 'ON' : 'OFF'}'); })),
+        Expanded(child: _devCard('DEHUM', dehumOn, Icons.opacity_rounded, Colors.blue, () => _toggleDevice('DEHUM', dehumOn, (v) => dehumOn = v))),
       ]),
     ]);
   }
 
   Widget _buildMasterControl() {
     bool locked = _tankFull;
+    bool disabled = !_connected;
     return GestureDetector(
-      onTap: locked ? null : _masterToggle,
+      onTap: (locked || disabled) ? null : _masterToggle,
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 250),
         padding: const EdgeInsets.symmetric(vertical: 24, horizontal: 20),
         decoration: BoxDecoration(
-          color: locked ? AppColors.alertRed.withOpacity(0.08) : _masterOn ? AppColors.activeGreen.withOpacity(0.1) : _card,
+          color: disabled ? _card.withValues(alpha: 0.5) : locked ? AppColors.alertRed.withValues(alpha: 0.08) : _masterOn ? AppColors.activeGreen.withValues(alpha: 0.1) : _card,
           borderRadius: BorderRadius.circular(20),
-          border: Border.all(color: locked ? AppColors.alertRed.withOpacity(0.3) : _masterOn ? AppColors.activeGreen.withOpacity(0.4) : _accent.withOpacity(0.15), width: 1.5),
+          border: Border.all(color: disabled ? _accent.withValues(alpha: 0.1) : locked ? AppColors.alertRed.withValues(alpha: 0.3) : _masterOn ? AppColors.activeGreen.withValues(alpha: 0.4) : _accent.withValues(alpha: 0.15), width: 1.5),
         ),
         child: Row(children: [
           Container(width: 56, height: 56,
             decoration: BoxDecoration(
-              color: locked ? AppColors.alertRed.withOpacity(0.15) : _masterOn ? AppColors.activeGreen.withOpacity(0.15) : _accent.withOpacity(0.08),
+              color: disabled ? _accent.withValues(alpha: 0.05) : locked ? AppColors.alertRed.withValues(alpha: 0.15) : _masterOn ? AppColors.activeGreen.withValues(alpha: 0.15) : _accent.withValues(alpha: 0.08),
               borderRadius: BorderRadius.circular(16)),
-            child: Icon(locked ? Icons.lock_rounded : Icons.power_settings_new_rounded,
-              color: locked ? AppColors.alertRed : _masterOn ? AppColors.activeGreen : _accent, size: 28)),
+            child: Icon(disabled ? Icons.link_off_rounded : locked ? Icons.lock_rounded : Icons.power_settings_new_rounded,
+              color: disabled ? _accent.withValues(alpha: 0.3) : locked ? AppColors.alertRed : _masterOn ? AppColors.activeGreen : _accent, size: 28)),
           const SizedBox(width: 16),
           Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text('Master Control', style: TextStyle(color: _textPrimary, fontSize: 17, fontWeight: FontWeight.w700)),
+            Text('Master Control', style: TextStyle(color: disabled ? _textPrimary.withValues(alpha: 0.4) : _textPrimary, fontSize: 17, fontWeight: FontWeight.w700)),
             const SizedBox(height: 2),
-            Text(locked ? 'Locked \u2014 Tank full' : _masterOn ? 'All devices ON \u2014 Tap to shut down' : 'All devices OFF \u2014 Tap to start',
+            Text(disabled ? 'Not connected' : locked ? 'Locked \u2014 Tank full' : _masterOn ? 'All devices ON \u2014 Tap to shut down' : 'All devices OFF \u2014 Tap to start',
               style: TextStyle(color: _textSecondary, fontSize: 12)),
           ])),
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
             decoration: BoxDecoration(
-              color: locked ? AppColors.alertRed.withOpacity(0.2) : _masterOn ? AppColors.activeGreen.withOpacity(0.2) : _accent.withOpacity(0.1),
+              color: disabled ? _accent.withValues(alpha: 0.06) : locked ? AppColors.alertRed.withValues(alpha: 0.2) : _masterOn ? AppColors.activeGreen.withValues(alpha: 0.2) : _accent.withValues(alpha: 0.1),
               borderRadius: BorderRadius.circular(20)),
-            child: Text(locked ? 'LOCKED' : _masterOn ? 'ON' : 'OFF',
-              style: TextStyle(color: locked ? AppColors.alertRed : _masterOn ? AppColors.activeGreen : _accent, fontWeight: FontWeight.w700, fontSize: 12)),
+            child: Text(disabled ? 'N/A' : locked ? 'LOCKED' : _masterOn ? 'ON' : 'OFF',
+              style: TextStyle(color: disabled ? _accent.withValues(alpha: 0.4) : locked ? AppColors.alertRed : _masterOn ? AppColors.activeGreen : _accent, fontWeight: FontWeight.w700, fontSize: 12)),
           ),
         ]),
       ),
@@ -759,28 +833,29 @@ class _DashboardPageState extends State<DashboardPage> with TickerProviderStateM
 
   Widget _devCard(String name, bool on, IconData icon, Color activeColor, VoidCallback onTap) {
     bool locked = _tankFull;
+    bool disabled = !_connected;
     return GestureDetector(
-      onTap: locked ? null : onTap,
+      onTap: (locked || disabled) ? null : onTap,
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 200),
         padding: const EdgeInsets.all(16),
         decoration: BoxDecoration(
-          color: locked ? AppColors.alertRed.withOpacity(0.06) : on ? activeColor.withOpacity(0.08) : _card,
+          color: disabled ? _card.withValues(alpha: 0.5) : locked ? AppColors.alertRed.withValues(alpha: 0.06) : on ? activeColor.withValues(alpha: 0.08) : _card,
           borderRadius: BorderRadius.circular(16),
-          border: Border.all(color: locked ? AppColors.alertRed.withOpacity(0.25) : on ? activeColor.withOpacity(0.4) : _accent.withOpacity(0.1)),
+          border: Border.all(color: disabled ? _accent.withValues(alpha: 0.08) : locked ? AppColors.alertRed.withValues(alpha: 0.25) : on ? activeColor.withValues(alpha: 0.4) : _accent.withValues(alpha: 0.1)),
         ),
         child: Column(children: [
-          Icon(icon, color: locked ? AppColors.alertRed.withOpacity(0.5) : on ? activeColor : _accent, size: 28),
+          Icon(icon, color: disabled ? _accent.withValues(alpha: 0.3) : locked ? AppColors.alertRed.withValues(alpha: 0.5) : on ? activeColor : _accent, size: 28),
           const SizedBox(height: 10),
-          Text(name, style: TextStyle(color: _textPrimary, fontSize: 12, fontWeight: FontWeight.w600)),
+          Text(name, style: TextStyle(color: disabled ? _textPrimary.withValues(alpha: 0.4) : _textPrimary, fontSize: 12, fontWeight: FontWeight.w600)),
           const SizedBox(height: 4),
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
             decoration: BoxDecoration(
-              color: locked ? AppColors.alertRed.withOpacity(0.15) : on ? activeColor.withOpacity(0.15) : _accent.withOpacity(0.08),
+              color: disabled ? _accent.withValues(alpha: 0.05) : locked ? AppColors.alertRed.withValues(alpha: 0.15) : on ? activeColor.withValues(alpha: 0.15) : _accent.withValues(alpha: 0.08),
               borderRadius: BorderRadius.circular(10)),
-            child: Text(locked ? 'LOCKED' : on ? 'ON' : 'OFF',
-              style: TextStyle(color: locked ? AppColors.alertRed : on ? activeColor : _accent, fontSize: 10, fontWeight: FontWeight.w700)),
+            child: Text(disabled ? 'N/A' : locked ? 'LOCKED' : on ? 'ON' : 'OFF',
+              style: TextStyle(color: disabled ? _accent.withValues(alpha: 0.4) : locked ? AppColors.alertRed : on ? activeColor : _accent, fontSize: 10, fontWeight: FontWeight.w700)),
           ),
         ]),
       ),
@@ -812,7 +887,7 @@ class _DashboardPageState extends State<DashboardPage> with TickerProviderStateM
           : ListView.builder(itemCount: _log.length, itemBuilder: (ctx, i) {
               String entry = _log[i];
               Color lc = _textSecondary;
-              if (entry.contains('error') || entry.contains('REJECT') || entry.contains('TANK FULL')) lc = AppColors.alertRed.withOpacity(0.8);
+              if (entry.contains('error') || entry.contains('REJECT') || entry.contains('TANK FULL')) lc = AppColors.alertRed.withValues(alpha: 0.8);
               else if (entry.contains('ACK') || entry.contains('OK') || entry.contains('updated') || entry.contains('Connected')) lc = AppColors.activeGreen;
               else if (entry.contains('TX:') || entry.contains('SENT:')) lc = AppColors.amber;
               return Padding(padding: const EdgeInsets.only(bottom: 4),

@@ -135,6 +135,15 @@ class BleRxCallbacks: public NimBLECharacteristicCallbacks {
     Serial.printf("   Parsed command: [%s] (%d chars)\n", cmd.c_str(), cmd.length());
     
     Serial.println("📲 BLE RX: " + cmd);
+
+    // Special command: GETSTATE (no colon required) — forward directly to transmitter
+    if (cmd == "GETSTATE") {
+      Serial.println("   📡 Forwarding GETSTATE query via LoRa...");
+      sendLoRaCommand(cmd);
+      bleNotify("FORWARDED:GETSTATE");
+      Serial.println("=========================================\n");
+      return;
+    }
     
     // Validate command format: should be DEVICE:ACTION (e.g., HEATER:ON)
     int colonPos = cmd.indexOf(':');
@@ -179,7 +188,7 @@ void setup() {
   Serial.begin(SERIAL_BAUD_RATE);
   delay(1000);
   
-  Serial.println("\n" + String(millis() / 1000) + "s: ========================================");
+  Serial.printf("\n%lus: ========================================\n", millis() / 1000);
   Serial.println("        ESP32 LoRa-Serial Bridge (Optimized)");
   Serial.println("        Combined Receiver with DIO0 Checking");
   Serial.println("========================================\n");
@@ -203,12 +212,6 @@ void setup() {
     Serial.println("   ✅ Module: SX1278 detected");
     Serial.println("   ✅ Mode: Receiver active");
     Serial.println("   ✅ CRC: Enabled");
-    
-    // ⚠️ FIX #1: REMOVE immediate RSSI read (causes -164 dBm artifact)
-    // RSSI is meaningless until first packet arrives - skip this check
-    // float currentRSSI = radio.getRSSI();
-    // Serial.printf("   📶 Current RSSI: %.1f dBm\n", currentRSSI);
-    
     Serial.println("\n   📊 RSSI Interpretation (after packet arrival):");
     Serial.println("      -30 to -60 dBm: Excellent signal");
     Serial.println("      -60 to -90 dBm: Good signal");
@@ -275,8 +278,6 @@ void setup() {
   
   // Start advertising
   pAdv->start();
-
-
   delay(200); // Give advertising time to start properly
   
   Serial.println("✓ BLE initialized (NUS-like)");
@@ -292,15 +293,16 @@ void setup() {
 // ================================================================================
 void loop() {
   unsigned long currentTime = millis();
+
+  // Periodic BLE connection check (every 5 seconds)
   static unsigned long lastConnCheck = 0;
-if (currentTime - lastConnCheck > 5000) {
-  lastConnCheck = currentTime;
-  if (pBleServer) {
-    Serial.printf("BLE connected clients: %d\n", pBleServer->getConnectedCount());
+  if (currentTime - lastConnCheck > 5000) {
+    lastConnCheck = currentTime;
+    if (pBleServer) {
+      Serial.printf("BLE connected clients: %d\n", pBleServer->getConnectedCount());
+    }
   }
-}
-  
-  
+
   // 1. Check for incoming LoRa data using DIO0 pin (most reliable)
   if (loraInitialized) {
     checkIncomingLoRaData();
@@ -331,8 +333,7 @@ if (currentTime - lastConnCheck > 5000) {
     // Only warn every 30 seconds (not every 5 seconds - reduces spam)
     if (currentTime - lastWarning >= 30000) {
       unsigned long secsSinceData = (currentTime - lastDataReceived) / 1000;
-      Serial.println("⚠️ WARNING: No LoRa data received for " + 
-                     String(secsSinceData) + " seconds");
+      Serial.printf("⚠️ WARNING: No LoRa data received for %lu seconds\n", secsSinceData);
       lastWarning = currentTime;
       
       // Restart receiver if timeout occurs
@@ -347,7 +348,7 @@ if (currentTime - lastConnCheck > 5000) {
 }
 
 // ================================================================================
-// SECTION 8: LORA INITIALIZATION (WITH FREQUENCY OFFSET & CRC FIX)
+// SECTION 8: LORA INITIALIZATION
 // ================================================================================
 bool initializeLoRa() {
   Serial.println("Initializing LoRa with frequency offset...");
@@ -362,7 +363,6 @@ bool initializeLoRa() {
   // Calculate frequency with offset
   float freqWithOffset = LORA_FREQUENCY + (FREQ_OFFSET / 1e6);
   
-  // Initialize WITHOUT CRC first
   int state = radio.begin(
     freqWithOffset,
     LORA_BANDWIDTH,
@@ -376,26 +376,22 @@ bool initializeLoRa() {
     return false;
   }
   
-  // CRITICAL FIX #2: Set CRC BEFORE starting receive (prevents error -24)
+  // Set CRC BEFORE starting receive
   radio.setCRC(true);
-  
-  // OPTIONAL: Set output power if you want to see transmitter side info
-  radio.setOutputPower(17);  // 17 dBm (typical max for SX1278)
+
+  // Set output power
+  radio.setOutputPower(17);
   Serial.println("   Output power set to 17 dBm");
-  
+
   // Start receive mode AFTER CRC configuration
   state = radio.startReceive();
   if (state != RADIOLIB_ERR_NONE) {
     Serial.printf("❌ startReceive failed (code %d)\n", state);
     return false;
   }
-  
-  // ⚠️ FIX #3: REMOVE immediate RSSI read (causes -164 dBm artifact)
-  // The -164 dBm you saw was NORMAL - RSSI register not updated yet
-  // Real RSSI appears ONLY after first packet reception
-  
+
   Serial.println("✅ LoRa initialized successfully!");
-  Serial.printf("   Frequency: %.3f MHz (Offset: %d Hz)\n", 
+  Serial.printf("   Frequency: %.3f MHz (Offset: %d Hz)\n",
                 freqWithOffset, FREQ_OFFSET);
   Serial.println("   Using DIO0 pin checking for reliable reception");
   
@@ -403,17 +399,16 @@ bool initializeLoRa() {
 }
 
 // ================================================================================
-// SECTION 9: LORA DATA RECEPTION (USING DIO0 PIN CHECKING - FIXED API)
+// SECTION 9: LORA DATA RECEPTION
 // ================================================================================
 void checkIncomingLoRaData() {
   // Method 1: Check DIO0 pin (most reliable for SX1278)
   if (digitalRead(LORA_DIO0) == HIGH) {
-    // ⚠️ FIX #4: CORRECT RadioLib API for SX1278 (was using invalid receive() method)
-    uint8_t buf[256] = {0};  // CRITICAL: Zero-initialize to prevent garbage after actual data
-    int state = radio.readData(buf, 255);  // MUST use buffer + length
+    uint8_t buf[256] = {0};
+    int state = radio.readData(buf, 255);
     
     if (state == RADIOLIB_ERR_NONE) {
-      // Use getPacketLength() to properly null-terminate (prevents garbage bytes in JSON)
+      // Properly null-terminate using actual packet length
       size_t pktLen = radio.getPacketLength();
       if (pktLen < 256) buf[pktLen] = 0;
       else buf[255] = 0;
@@ -430,8 +425,8 @@ void checkIncomingLoRaData() {
       long freqErr = radio.getFrequencyError();
       
       // Log reception
-      Serial.println("\n" + String(millis() / 1000) + "s: 📥 LoRa Data Received");
-      Serial.println("   Raw: " + loraData);
+      Serial.printf("\n%lus: 📥 LoRa Data Received\n", millis() / 1000);
+      Serial.printf("   Raw: %s\n", loraData.c_str());
       Serial.printf("   RSSI: %.1f dBm | SNR: %.1f dB | FreqErr: %ld Hz\n", 
                     rssi, snr, freqErr);
       
@@ -440,8 +435,7 @@ void checkIncomingLoRaData() {
       else if (rssi > -120) Serial.println("   💡 USABLE SIGNAL");
       else Serial.println("   ⚠️  WEAK SIGNAL");
 
-      // If the packet is a sensor CSV (6 fields: T1,H1,T2,H2,VOL,TANK), convert to JSON
-      // Simple check: data doesn't start with special prefix and contains commas
+      // Determine packet type and convert to JSON for BLE forwarding
       float testValues[6];
       int testCount = 0;
       parseCSVData(loraData, testValues, testCount);
@@ -451,36 +445,48 @@ void checkIncomingLoRaData() {
         String json = convertToJSON(loraData);
         Serial.println(json);
         bleNotify(json);
-      }
-       else if (loraData.startsWith("ACKCMD:")) {
-        // Command ACK from transmitter - forward structured JSON
-        // CRITICAL: Use escapeJsonString() to prevent control characters in JSON!
+      } else if (loraData.startsWith("ACKCMD:")) {
+        // Command ACK from transmitter - forward as structured JSON
         String safeRaw = escapeJsonString(loraData);
-        String json = "{";
-        json += "\"type\":\"ackcmd\",";
-        json += "\"raw\":\"" + safeRaw + "\",";
-        json += "\"timestamp\":" + String(millis() / 1000) + ",";
-        json += "\"rssi\":" + String(rssi, 1) + ",";
-        json += "\"snr\":" + String(snr, 1);
-        json += "}";
-        Serial.println(json);
-        bleNotify(json);
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+          "{\"type\":\"ackcmd\",\"raw\":\"%s\","
+          "\"timestamp\":%lu,\"rssi\":%.1f,\"snr\":%.1f}",
+          safeRaw.c_str(), millis() / 1000, rssi, snr);
+        Serial.println(buf);
+        bleNotify(String(buf));
       } else if (loraData.startsWith("STATUS:")) {
         // Tank status change from transmitter (TANK_FULL or TANK_OK)
         String statusValue = loraData.substring(7);  // After "STATUS:"
         statusValue.trim();
         Serial.printf("📡 STATUS received from transmitter: [%s]\n", statusValue.c_str());
         
-        String json = "{";
-        json += "\"type\":\"status\",";
-        json += "\"status\":\"" + escapeJsonString(statusValue) + "\",";
-        json += "\"tank_full\":" + String(statusValue == "TANK_FULL" ? "true" : "false") + ",";
-        json += "\"timestamp\":" + String(millis() / 1000) + ",";
-        json += "\"rssi\":" + String(rssi, 1) + ",";
-        json += "\"snr\":" + String(snr, 1);
-        json += "}";
-        Serial.println(json);
-        bleNotify(json);
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+          "{\"type\":\"status\",\"status\":\"%s\","
+          "\"tank_full\":%s,\"timestamp\":%lu,\"rssi\":%.1f,\"snr\":%.1f}",
+          escapeJsonString(statusValue).c_str(),
+          (statusValue == "TANK_FULL" ? "true" : "false"),
+          millis() / 1000, rssi, snr);
+        Serial.println(buf);
+        bleNotify(String(buf));
+      } else if (loraData.startsWith("DEVSTATE:")) {
+        // Device state report from transmitter (response to GETSTATE command)
+        String stateData = loraData.substring(9);  // After "DEVSTATE:"
+        int f1=0, f2=0, f3=0, ht=0, dh=0, tk=0;
+        sscanf(stateData.c_str(), "FAN1=%d,FAN2=%d,FAN3=%d,HEATER=%d,DEHUM=%d,TANK=%d",
+               &f1, &f2, &f3, &ht, &dh, &tk);
+
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+          "{\"type\":\"devstate\",\"fan1\":%s,\"fan2\":%s,\"fan3\":%s,"
+          "\"heater\":%s,\"dehum\":%s,\"tank_full\":%s,"
+          "\"timestamp\":%lu,\"rssi\":%.1f,\"snr\":%.1f}",
+          f1 ? "true" : "false", f2 ? "true" : "false", f3 ? "true" : "false",
+          ht ? "true" : "false", dh ? "true" : "false", tk ? "true" : "false",
+          millis() / 1000, rssi, snr);
+        Serial.println(buf);
+        bleNotify(String(buf));
       } else if (loraData.startsWith("REJECT:")) {
         // Expected format: REJECT:<command>:<REASON>
         int firstColon = loraData.indexOf(':'); // index of ':' after REJECT
@@ -493,28 +499,24 @@ void checkIncomingLoRaData() {
         } else {
           cmdStr = loraData.substring(firstColon + 1);
         }
-        String json = "{";
-        json += "\"type\":\"reject\",";
-        json += "\"command\":\"" + escapeJsonString(cmdStr) + "\",";
-        json += "\"reason\":\"" + escapeJsonString(reason) + "\",";
-        json += "\"timestamp\":" + String(millis() / 1000) + ",";
-        json += "\"rssi\":" + String(rssi, 1) + ",";
-        json += "\"snr\":" + String(snr, 1);
-        json += "}";
-        Serial.println(json);
-        bleNotify(json);
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+          "{\"type\":\"reject\",\"command\":\"%s\",\"reason\":\"%s\","
+          "\"timestamp\":%lu,\"rssi\":%.1f,\"snr\":%.1f}",
+          escapeJsonString(cmdStr).c_str(), escapeJsonString(reason).c_str(),
+          millis() / 1000, rssi, snr);
+        Serial.println(buf);
+        bleNotify(String(buf));
       } else {
         // Other non-sensor messages - forward as simple JSON
         String safeRaw = escapeJsonString(loraData);
-        String msg = "{";
-        msg += "\"type\":\"message\",";
-        msg += "\"raw\":\"" + safeRaw + "\",";
-        msg += "\"timestamp\":" + String(millis() / 1000) + ",";
-        msg += "\"rssi\":" + String(rssi, 1) + ",";
-        msg += "\"snr\":" + String(snr, 1);
-        msg += "}";
-        Serial.println(msg);
-        bleNotify(msg);
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+          "{\"type\":\"message\",\"raw\":\"%s\","
+          "\"timestamp\":%lu,\"rssi\":%.1f,\"snr\":%.1f}",
+          safeRaw.c_str(), millis() / 1000, rssi, snr);
+        Serial.println(buf);
+        bleNotify(String(buf));
       }
       
     } else if (state == RADIOLIB_ERR_CRC_MISMATCH) {
@@ -527,23 +529,15 @@ void checkIncomingLoRaData() {
                     state, failedPackets);
     }
     
-    // CRITICAL: Always restart receive after processing ANY packet
+    // Always restart receive after processing any packet
     radio.startReceive();
   }
-  
-  // REMOVED: radio.available() check (causes state corruption with SX1278)
-  // Alternative method removed to prevent error -24
 }
 
 // ================================================================================
-// SECTION 10: SERIAL COMMAND HANDLING
+// SECTION 10: DATA CONVERSION FUNCTIONS
 // ================================================================================
-
-
-// ================================================================================
-// SECTION 11: DATA CONVERSION FUNCTIONS
-// ================================================================================
-// Helper: Escape string for JSON (handle quotes, backslashes, newlines, etc.)
+// Escape string for safe JSON embedding
 String escapeJsonString(const String& str) {
   String result = "";
   for (int i = 0; i < str.length(); i++) {
@@ -580,20 +574,16 @@ String convertToJSON(const String& loraData) {
     return "{\"error\":\"Invalid data format\",\"raw\":\"" + safeData + "\",\"fields_found\":" + String(valueCount) + "}";
   }
   
-  // Build JSON object with proper escaping - only the 6 required fields
-  String json = "{";
-  json += "\"temp1\":" + String(values[0], 1) + ",";
-  json += "\"humid1\":" + String(values[1], 1) + ",";
-  json += "\"temp2\":" + String(values[2], 1) + ",";
-  json += "\"humid2\":" + String(values[3], 1) + ",";
-  json += "\"volume\":" + String(values[4], 1) + ",";
-  json += "\"tank_full\":" + String(values[5] == 1 ? "true" : "false") + ",";
-  json += "\"timestamp\":" + String(millis() / 1000) + ",";
-  json += "\"rssi\":" + String(radio.getRSSI(), 1) + ",";
-  json += "\"snr\":" + String(radio.getSNR(), 1);
-  json += "}";
-  
-  return json;
+  // Build JSON object with snprintf - only the 6 required fields
+  char buf[256];
+  snprintf(buf, sizeof(buf),
+    "{\"temp1\":%.1f,\"humid1\":%.1f,\"temp2\":%.1f,\"humid2\":%.1f,"
+    "\"volume\":%.1f,\"tank_full\":%s,"
+    "\"timestamp\":%lu,\"rssi\":%.1f,\"snr\":%.1f}",
+    values[0], values[1], values[2], values[3],
+    values[4], (values[5] == 1 ? "true" : "false"),
+    millis() / 1000, radio.getRSSI(), radio.getSNR());
+  return String(buf);
 }
 
 void parseCSVData(const String& data, float values[], int& count) {
@@ -618,7 +608,7 @@ void parseCSVData(const String& data, float values[], int& count) {
 }
 
 // ================================================================================
-// SECTION 12: LORA TRANSMISSION FUNCTION
+// SECTION 11: LORA TRANSMISSION FUNCTION
 // ================================================================================
 void sendLoRaCommand(const String& command) {
   if (!loraInitialized) {
@@ -679,7 +669,7 @@ void sendLoRaCommand(const String& command) {
 }
 
 // ================================================================================
-// SECTION 13: SYSTEM STATUS FUNCTION
+// SECTION 12: SYSTEM STATUS FUNCTION
 // ================================================================================
 void printSystemStatus() {
   unsigned long uptime = millis() / 1000;
@@ -687,14 +677,13 @@ void printSystemStatus() {
   float freqWithOffset = LORA_FREQUENCY + (FREQ_OFFSET / 1e6);
   
   Serial.println("\n📊 SYSTEM STATUS =======================");
-  Serial.println("   Uptime: " + String(uptime) + " seconds");
-  Serial.println("   LoRa: " + String(loraInitialized ? "READY" : "FAILED"));
+  Serial.printf("   Uptime: %lu seconds\n", uptime);
+  Serial.printf("   LoRa: %s\n", loraInitialized ? "READY" : "FAILED");
   
   if (loraInitialized) {
     Serial.printf("   Frequency: %.3f MHz (Offset: %d Hz)\n", 
                   freqWithOffset, FREQ_OFFSET);
-    Serial.println("   Packets: " + String(packetCounter) + " received, " + 
-                   String(failedPackets) + " errors");
+    Serial.printf("   Packets: %u received, %u errors\n", packetCounter, failedPackets);
     
     if (packetCounter > 0) {
       float successRate = (float)packetCounter / (packetCounter + failedPackets) * 100;
@@ -702,14 +691,13 @@ void printSystemStatus() {
     }
     
     if (lastDataReceived > 0) {
-      Serial.println("   Last data: " + String(lastDataSec) + " seconds ago");
+      Serial.printf("   Last data: %lu seconds ago\n", lastDataSec);
     }
-    
-    // ✅ REAL RSSI appears HERE (after packets received)
+
     Serial.printf("   Current RSSI: %.1f dBm\n", radio.getRSSI());
   }
   
-  Serial.println("   DIO0 Pin State: " + String(digitalRead(LORA_DIO0) ? "HIGH" : "LOW"));
+  Serial.printf("   DIO0 Pin State: %s\n", digitalRead(LORA_DIO0) ? "HIGH" : "LOW");
   Serial.println("======================================\n");
 }
 
